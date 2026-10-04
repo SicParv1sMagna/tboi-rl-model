@@ -10,8 +10,17 @@ import numpy as np
 from gymnasium import spaces
 
 
+# =========================================================
+# NETWORK CONFIG
+# =========================================================
+
 HOST = "127.0.0.1"
 PORT = 5000
+
+
+# =========================================================
+# ACTION NAMES
+# =========================================================
 
 MOVE_NAMES = (
     "NONE",
@@ -30,9 +39,30 @@ SHOOT_NAMES = (
 )
 
 
+# =========================================================
+# REWARD CONFIG
+# =========================================================
+
+STEP_PENALTY = -0.01
+
+DAMAGE_DEALT_REWARD = 0.05
+
+KILL_REWARD = 3.0
+
+VICTORY_REWARD = 20.0
+
+HP_LOST_PENALTY = 5.0
+
+VICTORY_HP_BONUS_MULTIPLIER = 1.5
+
+DEATH_PENALTY = -25.0
+
+TIMEOUT_PENALTY = -2.0
+
+
 class IsaacEnv(gym.Env):
     """
-    Minimal Gymnasium environment for The Binding of Isaac: Afterbirth+.
+    Gymnasium environment for The Binding of Isaac: Afterbirth+.
 
     Action:
         [move, shoot]
@@ -44,18 +74,26 @@ class IsaacEnv(gym.Env):
         4 = DOWN
 
     Observation contains 13 normalized float values:
+
         0  player x relative to room center
         1  player y relative to room center
+
         2  player velocity x
         3  player velocity y
+
         4  red hearts
         5  soul hearts
+
         6  nearest enemy dx
         7  nearest enemy dy
+
         8  nearest enemy velocity x
         9  nearest enemy velocity y
+
         10 nearest enemy hp fraction
+
         11 enemy count
+
         12 room clear flag
     """
 
@@ -77,18 +115,20 @@ class IsaacEnv(gym.Env):
 
         self.host = host
         self.port = port
+
         self.max_episode_steps = max_episode_steps
         self.socket_timeout = socket_timeout
+
         self.render_mode = render_mode
 
+        # -------------------------------------------------
+        # Gymnasium spaces
+        # -------------------------------------------------
+
         # action = [move, shoot]
-        #
-        # 0 NONE
-        # 1 LEFT
-        # 2 RIGHT
-        # 3 UP
-        # 4 DOWN
-        self.action_space = spaces.MultiDiscrete([5, 5])
+        self.action_space = spaces.MultiDiscrete(
+            [5, 5]
+        )
 
         self.observation_space = spaces.Box(
             low=-2.0,
@@ -97,15 +137,26 @@ class IsaacEnv(gym.Env):
             dtype=np.float32,
         )
 
+        # -------------------------------------------------
+        # TCP
+        # -------------------------------------------------
+
         self._server: socket.socket | None = None
         self._conn: socket.socket | None = None
 
         self._rx_buffer = b""
 
+        # -------------------------------------------------
+        # Environment state
+        # -------------------------------------------------
+
         self._last_state: dict[str, Any] | None = None
 
         self._episode_steps = 0
         self._action_id = 0
+
+        # Total damage taken during the current episode.
+        self._episode_hp_lost = 0.0
 
         self._open_server()
 
@@ -126,7 +177,10 @@ class IsaacEnv(gym.Env):
         )
 
         server.bind(
-            (self.host, self.port)
+            (
+                self.host,
+                self.port,
+            )
         )
 
         server.listen(1)
@@ -174,6 +228,7 @@ class IsaacEnv(gym.Env):
         if self._conn is not None:
             try:
                 self._conn.close()
+
             except OSError:
                 pass
 
@@ -218,7 +273,9 @@ class IsaacEnv(gym.Env):
 
         while b"\n" not in self._rx_buffer:
             try:
-                chunk = self._conn.recv(65536)
+                chunk = self._conn.recv(
+                    65536
+                )
 
             except socket.timeout as exc:
                 raise TimeoutError(
@@ -340,6 +397,10 @@ class IsaacEnv(gym.Env):
             [],
         )
 
+        # -------------------------------------------------
+        # Player
+        # -------------------------------------------------
+
         px = float(
             player.get(
                 "x",
@@ -368,6 +429,10 @@ class IsaacEnv(gym.Env):
             )
         )
 
+        # -------------------------------------------------
+        # Room
+        # -------------------------------------------------
+
         center_x = float(
             room.get(
                 "center_x",
@@ -382,6 +447,10 @@ class IsaacEnv(gym.Env):
             )
         )
 
+        # -------------------------------------------------
+        # Health
+        # -------------------------------------------------
+
         hearts = float(
             player.get(
                 "hearts",
@@ -395,6 +464,10 @@ class IsaacEnv(gym.Env):
                 0.0,
             )
         )
+
+        # -------------------------------------------------
+        # Nearest enemy
+        # -------------------------------------------------
 
         nearest = None
         nearest_dist_sq = None
@@ -432,8 +505,10 @@ class IsaacEnv(gym.Env):
         if nearest is None:
             enemy_dx = 0.0
             enemy_dy = 0.0
+
             enemy_vx = 0.0
             enemy_vy = 0.0
+
             enemy_hp_fraction = 0.0
 
         else:
@@ -493,6 +568,10 @@ class IsaacEnv(gym.Env):
                 / enemy_max_hp
             )
 
+        # -------------------------------------------------
+        # Room state
+        # -------------------------------------------------
+
         enemy_count = float(
             state.get(
                 "enemy_count",
@@ -508,6 +587,10 @@ class IsaacEnv(gym.Env):
             )
             else 0.0
         )
+
+        # -------------------------------------------------
+        # Build observation
+        # -------------------------------------------------
 
         observation = np.array(
             [
@@ -577,7 +660,7 @@ class IsaacEnv(gym.Env):
         return observation
 
     # =====================================================
-    # REWARD
+    # HEALTH
     # =====================================================
 
     @staticmethod
@@ -604,6 +687,10 @@ class IsaacEnv(gym.Env):
             )
         )
 
+    # =====================================================
+    # REWARD
+    # =====================================================
+
     def _calculate_reward(
         self,
         previous: dict[str, Any],
@@ -613,9 +700,15 @@ class IsaacEnv(gym.Env):
         bool,
         dict[str, Any],
     ]:
-        # Small time penalty:
-        # encourages finishing faster.
-        reward = -0.01
+        # -------------------------------------------------
+        # Small time penalty
+        # -------------------------------------------------
+
+        reward = STEP_PENALTY
+
+        # -------------------------------------------------
+        # Enemy damage
+        # -------------------------------------------------
 
         previous_enemy_hp = float(
             previous.get(
@@ -637,10 +730,16 @@ class IsaacEnv(gym.Env):
             - current_enemy_hp,
         )
 
-        reward += (
+        damage_reward = (
             damage_dealt
-            * 0.05
+            * DAMAGE_DEALT_REWARD
         )
+
+        reward += damage_reward
+
+        # -------------------------------------------------
+        # Enemy kills
+        # -------------------------------------------------
 
         previous_enemy_count = int(
             previous.get(
@@ -662,10 +761,16 @@ class IsaacEnv(gym.Env):
             - current_enemy_count,
         )
 
-        reward += (
+        kill_reward = (
             killed_enemies
-            * 3.0
+            * KILL_REWARD
         )
+
+        reward += kill_reward
+
+        # -------------------------------------------------
+        # Player damage
+        # -------------------------------------------------
 
         previous_hp = self._player_hp(
             previous
@@ -681,10 +786,16 @@ class IsaacEnv(gym.Env):
             - current_hp,
         )
 
-        reward -= (
+        damage_taken_penalty = (
             hp_lost
-            * 2.0
+            * HP_LOST_PENALTY
         )
+
+        reward -= damage_taken_penalty
+
+        # -------------------------------------------------
+        # Episode result
+        # -------------------------------------------------
 
         enemy_defeated = (
             previous_enemy_count > 0
@@ -702,23 +813,61 @@ class IsaacEnv(gym.Env):
             )
         )
 
+        # -------------------------------------------------
+        # Victory
+        # -------------------------------------------------
+
+        victory_health_bonus = 0.0
+
         if enemy_defeated:
-            reward += 20.0
+            reward += VICTORY_REWARD
+
+            # Stage 2:
+            # winning with more HP is more valuable.
+            victory_health_bonus = (
+                current_hp
+                * VICTORY_HP_BONUS_MULTIPLIER
+            )
+
+            reward += victory_health_bonus
+
+        # -------------------------------------------------
+        # Death
+        # -------------------------------------------------
 
         if dead:
-            reward -= 25.0
+            reward += DEATH_PENALTY
 
         terminated = (
             enemy_defeated
             or dead
         )
 
+        # -------------------------------------------------
+        # Debug / evaluation information
+        # -------------------------------------------------
+
         info = {
             "damage_dealt": damage_dealt,
+            "damage_reward": damage_reward,
+
             "killed_enemies": killed_enemies,
+            "kill_reward": kill_reward,
+
             "hp_lost": hp_lost,
-            "enemy_defeated": enemy_defeated,
-            "dead": dead,
+            "damage_taken_penalty":
+                damage_taken_penalty,
+
+            "remaining_hp": current_hp,
+
+            "victory_health_bonus":
+                victory_health_bonus,
+
+            "enemy_defeated":
+                enemy_defeated,
+
+            "dead":
+                dead,
         }
 
         return (
@@ -811,6 +960,8 @@ class IsaacEnv(gym.Env):
         self._episode_steps = 0
         self._action_id = 0
 
+        self._episode_hp_lost = 0.0
+
         observation = self._state_to_obs(
             new_state
         )
@@ -818,6 +969,10 @@ class IsaacEnv(gym.Env):
         info = self._make_info(
             new_state
         )
+
+        info["episode_steps"] = 0
+        info["episode_hp_lost"] = 0.0
+        info["no_hit"] = True
 
         print(
             f"[IsaacEnv] Episode "
@@ -847,6 +1002,10 @@ class IsaacEnv(gym.Env):
             raise RuntimeError(
                 "Call env.reset() before env.step()."
             )
+
+        # -------------------------------------------------
+        # Validate action
+        # -------------------------------------------------
 
         action_array = np.asarray(
             action,
@@ -887,11 +1046,13 @@ class IsaacEnv(gym.Env):
                 f"{shoot_index}"
             )
 
+        # -------------------------------------------------
+        # Send action
+        # -------------------------------------------------
+
         self._action_id += 1
 
-        action_id = (
-            self._action_id
-        )
+        action_id = self._action_id
 
         episode_id = int(
             self._last_state.get(
@@ -903,16 +1064,28 @@ class IsaacEnv(gym.Env):
         self._send_json(
             {
                 "type": "action",
-                "action_id": action_id,
-                "enabled": True,
-                "move": MOVE_NAMES[
-                    move_index
-                ],
-                "shoot": SHOOT_NAMES[
-                    shoot_index
-                ],
+
+                "action_id":
+                    action_id,
+
+                "enabled":
+                    True,
+
+                "move":
+                    MOVE_NAMES[
+                        move_index
+                    ],
+
+                "shoot":
+                    SHOOT_NAMES[
+                        shoot_index
+                    ],
             }
         )
+
+        # -------------------------------------------------
+        # Wait for state after action
+        # -------------------------------------------------
 
         new_state = self._wait_for(
             lambda state: (
@@ -934,6 +1107,10 @@ class IsaacEnv(gym.Env):
             timeout=10.0,
         )
 
+        # -------------------------------------------------
+        # Reward
+        # -------------------------------------------------
+
         (
             reward,
             terminated,
@@ -943,7 +1120,19 @@ class IsaacEnv(gym.Env):
             new_state,
         )
 
+        # -------------------------------------------------
+        # Episode statistics
+        # -------------------------------------------------
+
         self._episode_steps += 1
+
+        self._episode_hp_lost += float(
+            reward_info["hp_lost"]
+        )
+
+        # -------------------------------------------------
+        # Timeout
+        # -------------------------------------------------
 
         truncated = (
             self._episode_steps
@@ -954,13 +1143,21 @@ class IsaacEnv(gym.Env):
             truncated
             and not terminated
         ):
-            reward -= 2.0
+            reward += TIMEOUT_PENALTY
+
+        # -------------------------------------------------
+        # Store current state
+        # -------------------------------------------------
 
         self._last_state = new_state
 
         observation = self._state_to_obs(
             new_state
         )
+
+        # -------------------------------------------------
+        # Info
+        # -------------------------------------------------
 
         info = self._make_info(
             new_state
@@ -972,6 +1169,20 @@ class IsaacEnv(gym.Env):
 
         info["episode_steps"] = (
             self._episode_steps
+        )
+
+        info["episode_hp_lost"] = (
+            self._episode_hp_lost
+        )
+
+        info["no_hit"] = (
+            self._episode_hp_lost
+            == 0.0
+        )
+
+        info["timeout"] = bool(
+            truncated
+            and not terminated
         )
 
         return (
@@ -1019,9 +1230,10 @@ class IsaacEnv(gym.Env):
                 )
             ),
 
-            "player_hp": self._player_hp(
-                state
-            ),
+            "player_hp":
+                self._player_hp(
+                    state
+                ),
         }
 
     # =====================================================
@@ -1033,6 +1245,7 @@ class IsaacEnv(gym.Env):
             print(
                 "[IsaacEnv] No state yet."
             )
+
             return
 
         info = self._make_info(
@@ -1063,15 +1276,21 @@ class IsaacEnv(gym.Env):
             try:
                 self._send_json(
                     {
-                        "type": "action",
+                        "type":
+                            "action",
 
                         "action_id":
                             self._action_id
                             + 1,
 
-                        "enabled": False,
-                        "move": "NONE",
-                        "shoot": "NONE",
+                        "enabled":
+                            False,
+
+                        "move":
+                            "NONE",
+
+                        "shoot":
+                            "NONE",
                     }
                 )
 
@@ -1083,88 +1302,8 @@ class IsaacEnv(gym.Env):
         if self._server is not None:
             try:
                 self._server.close()
+
             except OSError:
                 pass
 
         self._server = None
-
-
-# =========================================================
-# SMOKE TEST
-# =========================================================
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("ISAAC GYMNASIUM ENV - SMOKE TEST")
-    print("=" * 60)
-
-    print(
-        "Start this script first, "
-        "then start Isaac with --luadebug."
-    )
-
-    print()
-
-    env = IsaacEnv(
-        max_episode_steps=100,
-        render_mode="human",
-    )
-
-    try:
-        observation, info = (
-            env.reset()
-        )
-
-        print(
-            "Initial observation:",
-            observation,
-        )
-
-        print(
-            "Initial info:",
-            info,
-        )
-
-        total_reward = 0.0
-
-        for step_number in range(
-            100
-        ):
-            action = (
-                env.action_space.sample()
-            )
-
-            (
-                observation,
-                reward,
-                terminated,
-                truncated,
-                info,
-            ) = env.step(
-                action
-            )
-
-            total_reward += reward
-
-            print(
-                f"step={step_number + 1:03d} "
-                f"action={action.tolist()} "
-                f"reward={reward:+.3f} "
-                f"total={total_reward:+.3f} "
-                f"enemies={info['enemy_count']} "
-                f"hp={info['player_hp']:.1f}"
-            )
-
-            if (
-                terminated
-                or truncated
-            ):
-                print(
-                    "Episode finished:",
-                    info,
-                )
-
-                break
-
-    finally:
-        env.close()

@@ -53,6 +53,38 @@ local TRAINING_ENEMY_VARIANT = 0
 local TRAINING_ENEMY_SUBTYPE = 0
 
 
+-- Possible enemy spawn offsets relative to room center.
+--
+-- One position is selected randomly for each episode.
+local TRAINING_ENEMY_OFFSETS = {
+
+    -- Right
+    Vector(
+        160,
+        0
+    ),
+
+    -- Left
+    Vector(
+        -160,
+        0
+    ),
+
+    -- Down
+    Vector(
+        0,
+        120
+    ),
+
+    -- Up
+    Vector(
+        0,
+        -120
+    )
+
+}
+
+
 -- =========================================================
 -- RL CONTROL
 --
@@ -65,7 +97,15 @@ RL_ENABLED = false
 RL_MOVE = "NONE"
 RL_SHOOT = "NONE"
 
+-- Last action that has had at least one game update
+-- to affect Isaac. Python treats this ID as applied.
 RL_ACTION_ID = 0
+
+-- Action received from Python but not yet acknowledged.
+local pendingActionId = nil
+
+-- Game frame on which the pending action was received.
+local pendingActionFrame = nil
 
 
 -- =========================================================
@@ -100,18 +140,36 @@ local txBuffer = ""
 -- =========================================================
 
 local MOVE_ACTIONS = {
-    LEFT = ButtonAction.ACTION_LEFT,
-    RIGHT = ButtonAction.ACTION_RIGHT,
-    UP = ButtonAction.ACTION_UP,
-    DOWN = ButtonAction.ACTION_DOWN
+
+    LEFT =
+        ButtonAction.ACTION_LEFT,
+
+    RIGHT =
+        ButtonAction.ACTION_RIGHT,
+
+    UP =
+        ButtonAction.ACTION_UP,
+
+    DOWN =
+        ButtonAction.ACTION_DOWN
+
 }
 
 
 local SHOOT_ACTIONS = {
-    LEFT = ButtonAction.ACTION_SHOOTLEFT,
-    RIGHT = ButtonAction.ACTION_SHOOTRIGHT,
-    UP = ButtonAction.ACTION_SHOOTUP,
-    DOWN = ButtonAction.ACTION_SHOOTDOWN
+
+    LEFT =
+        ButtonAction.ACTION_SHOOTLEFT,
+
+    RIGHT =
+        ButtonAction.ACTION_SHOOTRIGHT,
+
+    UP =
+        ButtonAction.ACTION_SHOOTUP,
+
+    DOWN =
+        ButtonAction.ACTION_SHOOTDOWN
+
 }
 
 
@@ -140,7 +198,9 @@ Isaac.DebugString(
 -- HELPERS
 -- =========================================================
 
-local function IsValidDirection(value)
+local function IsValidDirection(
+    value
+)
 
     return
         value == "NONE"
@@ -156,7 +216,9 @@ end
 -- DISCONNECT
 -- =========================================================
 
-local function DisconnectPython(reason)
+local function DisconnectPython(
+    reason
+)
 
     if tcp ~= nil then
 
@@ -177,9 +239,15 @@ local function DisconnectPython(reason)
     RL_SHOOT = "NONE"
 
 
+    pendingActionId = nil
+    pendingActionFrame = nil
+
+
     Isaac.DebugString(
         "RL_SOCKET DISCONNECTED: "
-        .. tostring(reason)
+        .. tostring(
+            reason
+        )
     )
 
 end
@@ -242,10 +310,15 @@ local function ConnectToPython()
 
     if success then
 
-        tcp = client
+        tcp =
+            client
 
-        rxBuffer = ""
-        txBuffer = ""
+
+        rxBuffer =
+            ""
+
+        txBuffer =
+            ""
 
 
         -- Non-blocking after connection.
@@ -286,13 +359,24 @@ local function SpawnTrainingEnemy()
         room:GetCenterPos()
 
 
-    -- Spawn the enemy to the right of room center.
+    -- Pick one of the configured spawn positions.
+    local offsetIndex =
+        (
+            Random()
+            % #TRAINING_ENEMY_OFFSETS
+        )
+        + 1
+
+
+    local spawnOffset =
+        TRAINING_ENEMY_OFFSETS[
+            offsetIndex
+        ]
+
+
     local desiredPosition =
         center
-        + Vector(
-            160,
-            0
-        )
+        + spawnOffset
 
 
     local spawnPosition =
@@ -341,10 +425,52 @@ local function SpawnTrainingEnemy()
         .. tostring(
             episodeId
         )
+        .. " spawn_index="
+        .. tostring(
+            offsetIndex
+        )
     )
 
 
     return true
+
+end
+
+
+-- =========================================================
+-- CLOSE TRAINING ROOM DOORS
+-- =========================================================
+
+local function CloseTrainingRoomDoors()
+
+    local room =
+        game:GetRoom()
+
+
+    if room == nil then
+        return
+    end
+
+
+    for slot = 0,
+        DoorSlot.NUM_DOOR_SLOTS - 1 do
+
+
+        local door =
+            room:GetDoor(
+                slot
+            )
+
+
+        if door ~= nil then
+
+            door:Close(
+                true
+            )
+
+        end
+
+    end
 
 end
 
@@ -384,6 +510,14 @@ local function RequestReset()
         "NONE"
 
 
+    pendingActionId =
+        nil
+
+
+    pendingActionFrame =
+        nil
+
+
     Isaac.DebugString(
         "RL_RESET REQUESTED"
     )
@@ -400,7 +534,9 @@ end
 -- COMMAND FROM PYTHON
 -- =========================================================
 
-local function ProcessCommand(line)
+local function ProcessCommand(
+    line
+)
 
     local success, command =
         pcall(
@@ -413,7 +549,9 @@ local function ProcessCommand(line)
 
         Isaac.DebugString(
             "RL BAD JSON: "
-            .. tostring(line)
+            .. tostring(
+                line
+            )
         )
 
         return
@@ -421,8 +559,9 @@ local function ProcessCommand(line)
     end
 
 
-    if type(command)
-        ~= "table" then
+    if type(
+        command
+    ) ~= "table" then
 
         return
 
@@ -460,11 +599,24 @@ local function ProcessCommand(line)
         ~= nil then
 
 
-        RL_ACTION_ID =
+        local newActionId =
             tonumber(
                 command.action_id
             )
-            or RL_ACTION_ID
+
+
+        if newActionId
+            ~= nil then
+
+
+            pendingActionId =
+                newActionId
+
+
+            pendingActionFrame =
+                game:GetFrameCount()
+
+        end
 
     end
 
@@ -968,7 +1120,9 @@ end
 -- QUEUE OBSERVATION
 -- =========================================================
 
-local function QueueState(state)
+local function QueueState(
+    state
+)
 
     if tcp == nil then
         return
@@ -1016,7 +1170,8 @@ function mod:OnGameStarted(
 )
 
     episodeId =
-        episodeId + 1
+        episodeId
+        + 1
 
 
     gameOver =
@@ -1049,6 +1204,14 @@ function mod:OnGameStarted(
 
     RL_ACTION_ID =
         0
+
+
+    pendingActionId =
+        nil
+
+
+    pendingActionFrame =
+        nil
 
 
     Isaac.DebugString(
@@ -1091,6 +1254,14 @@ function mod:OnGameEnd(
         "NONE"
 
 
+    pendingActionId =
+        nil
+
+
+    pendingActionFrame =
+        nil
+
+
     Isaac.DebugString(
         "RL_EPISODE END"
     )
@@ -1113,6 +1284,34 @@ function mod:OnUpdate()
     ReadPythonCommands()
 
     FlushOutgoing()
+
+
+    -- =====================================================
+    -- ACKNOWLEDGE APPLIED ACTION
+    -- =====================================================
+
+    local currentFrame =
+        game:GetFrameCount()
+
+
+    if pendingActionId ~= nil
+    and pendingActionFrame ~= nil
+    and currentFrame
+        > pendingActionFrame then
+
+
+        RL_ACTION_ID =
+            pendingActionId
+
+
+        pendingActionId =
+            nil
+
+
+        pendingActionFrame =
+            nil
+
+    end
 
 
     -- =====================================================
@@ -1145,6 +1344,13 @@ function mod:OnUpdate()
         return
 
     end
+
+
+    -- =====================================================
+    -- KEEP AGENT INSIDE TRAINING ROOM
+    -- =====================================================
+
+    CloseTrainingRoomDoors()
 
 
     local frame =

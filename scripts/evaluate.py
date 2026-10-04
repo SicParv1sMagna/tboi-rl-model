@@ -9,7 +9,12 @@ from stable_baselines3 import PPO
 from isaac_rl import IsaacEnv
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+# =========================================================
+# ARGUMENTS
+# =========================================================
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,13 +29,16 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=Path,
         required=True,
-        help="Path to the trained PPO .zip model.",
+        help=(
+            "Path to PPO model, for example "
+            "models/ppo_2026-10-05_04-00-00_final.zip"
+        ),
     )
 
     parser.add_argument(
         "--episodes",
         type=int,
-        default=20,
+        default=10,
         help="Number of evaluation episodes.",
     )
 
@@ -38,90 +46,189 @@ def parse_args() -> argparse.Namespace:
         "--max-episode-steps",
         type=int,
         default=600,
-        help="Maximum number of steps per episode.",
+        help="Maximum steps per episode.",
+    )
+
+    parser.add_argument(
+        "--stochastic",
+        action="store_true",
+        help=(
+            "Use stochastic policy actions instead of "
+            "deterministic evaluation."
+        ),
     )
 
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+# =========================================================
+# MODEL PATH
+# =========================================================
 
-    model_path = args.model
 
+def resolve_model_path(
+    model_path: Path,
+) -> Path:
     if not model_path.is_absolute():
         model_path = (
             PROJECT_ROOT
             / model_path
         )
 
-    if not model_path.exists():
-        raise FileNotFoundError(
-            f"Model not found: {model_path}"
+    model_path = model_path.resolve()
+
+    if model_path.exists():
+        return model_path
+
+    # Stable-Baselines3 commonly stores models as .zip.
+    if model_path.suffix != ".zip":
+        zip_path = model_path.with_suffix(
+            ".zip"
         )
 
-    print("=" * 60)
-    print("ISAAC RL - PPO EVALUATION")
-    print("=" * 60)
+        if zip_path.exists():
+            return zip_path
 
-    print(
-        f"Model: {model_path}"
+    raise FileNotFoundError(
+        f"Model not found: {model_path}"
+    )
+
+
+# =========================================================
+# SAFE MEAN
+# =========================================================
+
+
+def safe_mean(
+    values: list[float],
+) -> float:
+    if not values:
+        return 0.0
+
+    return float(
+        np.mean(values)
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+
+def main() -> None:
+    args = parse_args()
+
+    model_path = resolve_model_path(
+        args.model
+    )
+
+    deterministic = (
+        not args.stochastic
     )
 
     print(
-        f"Episodes: {args.episodes}"
+        "=" * 60
     )
-
-    print()
 
     print(
-        "Start Isaac with --luadebug "
-        "and start a new run."
+        "ISAAC RL EVALUATION"
     )
 
-    print()
-
-    env = IsaacEnv(
-        max_episode_steps=args.max_episode_steps,
+    print(
+        "=" * 60
     )
+
+    print(
+        f"Model:         {model_path}"
+    )
+
+    print(
+        f"Episodes:      {args.episodes}"
+    )
+
+    print(
+        f"Deterministic: {deterministic}"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    # -----------------------------------------------------
+    # Load PPO
+    #
+    # We do not need to attach the environment to PPO
+    # for model.predict().
+    # -----------------------------------------------------
 
     model = PPO.load(
-        model_path,
-        env=env,
+        str(model_path)
     )
 
+    env = IsaacEnv(
+        max_episode_steps=(
+            args.max_episode_steps
+        )
+    )
+
+    # -----------------------------------------------------
+    # Aggregated statistics
+    # -----------------------------------------------------
+
     episode_rewards: list[float] = []
-    episode_lengths: list[int] = []
+
+    episode_lengths: list[float] = []
+
     episode_hp_lost: list[float] = []
+
     remaining_hp_values: list[float] = []
 
+    successful_exit_lengths: list[float] = []
+
+
     wins = 0
+
     deaths = 0
+
     timeouts = 0
 
+    unknowns = 0
+
+
     no_hit_episodes = 0
+
     no_hit_wins = 0
 
+
     try:
-        for episode in range(
+        for episode_index in range(
             1,
             args.episodes + 1,
         ):
-            observation, info = env.reset()
+            observation, reset_info = (
+                env.reset()
+            )
 
             total_reward = 0.0
+
             steps = 0
 
             terminated = False
+
             truncated = False
+
+            info = reset_info
+
 
             while (
                 not terminated
                 and not truncated
             ):
-                action, _state = model.predict(
-                    observation,
-                    deterministic=True,
+                action, _state = (
+                    model.predict(
+                        observation,
+                        deterministic=deterministic,
+                    )
                 )
 
                 (
@@ -134,8 +241,16 @@ def main() -> None:
                     action
                 )
 
-                total_reward += reward
+                total_reward += float(
+                    reward
+                )
+
                 steps += 1
+
+
+            # =================================================
+            # FINAL EPISODE STATE
+            # =================================================
 
             hp_lost = float(
                 info.get(
@@ -161,12 +276,89 @@ def main() -> None:
                 )
             )
 
+            exited_training_room = bool(
+                info.get(
+                    "exited_training_room",
+                    False,
+                )
+            )
+
+            dead = bool(
+                info.get(
+                    "dead",
+                    False,
+                )
+            )
+
+            timeout = bool(
+                info.get(
+                    "timeout",
+                    False,
+                )
+                or (
+                    truncated
+                    and not terminated
+                )
+            )
+
+
+            # =================================================
+            # RESULT CLASSIFICATION
+            # =================================================
+            #
+            # IMPORTANT:
+            #
+            # Successful navigation is determined by an actual
+            # transition out of the training room.
+            #
+            # Killing the enemy alone is NOT enough.
+            # =================================================
+
+            if exited_training_room:
+                result = "WIN"
+
+                wins += 1
+
+                successful_exit_lengths.append(
+                    float(
+                        steps
+                    )
+                )
+
+                if no_hit:
+                    no_hit_wins += 1
+
+
+            elif dead:
+                result = "DEATH"
+
+                deaths += 1
+
+
+            elif timeout:
+                result = "TIMEOUT"
+
+                timeouts += 1
+
+
+            else:
+                result = "UNKNOWN"
+
+                unknowns += 1
+
+
+            if no_hit:
+                no_hit_episodes += 1
+
+
             episode_rewards.append(
                 total_reward
             )
 
             episode_lengths.append(
-                steps
+                float(
+                    steps
+                )
             )
 
             episode_hp_lost.append(
@@ -177,189 +369,220 @@ def main() -> None:
                 remaining_hp
             )
 
-            # ---------------------------------------------
-            # Episode result
-            # ---------------------------------------------
 
-            if info.get(
-                "enemy_defeated",
-                False,
-            ):
-                result = "WIN"
-                wins += 1
+            no_hit_text = (
+                "YES"
+                if no_hit
+                else "NO"
+            )
 
-                if no_hit:
-                    no_hit_wins += 1
-
-            elif info.get(
-                "dead",
-                False,
-            ):
-                result = "DEATH"
-                deaths += 1
-
-            elif truncated:
-                result = "TIMEOUT"
-                timeouts += 1
-
-            else:
-                result = "UNKNOWN"
-
-            if no_hit:
-                no_hit_episodes += 1
-
-            # ---------------------------------------------
-            # Per-episode output
-            # ---------------------------------------------
 
             print(
-                f"episode={episode:03d} "
+                f"episode={episode_index:03d} "
                 f"result={result:<7} "
                 f"reward={total_reward:+8.3f} "
                 f"steps={steps:4d} "
                 f"hp={remaining_hp:4.1f} "
                 f"hp_lost={hp_lost:4.1f} "
-                f"no_hit={'YES' if no_hit else 'NO'}"
+                f"no_hit={no_hit_text}"
             )
 
-        # =================================================
-        # Aggregate metrics
-        # =================================================
 
-        mean_reward = float(
-            np.mean(
-                episode_rewards
-            )
-        )
+    finally:
+        env.close()
 
-        mean_length = float(
-            np.mean(
-                episode_lengths
-            )
-        )
 
-        mean_hp_lost = float(
-            np.mean(
-                episode_hp_lost
-            )
-        )
+    # =====================================================
+    # AGGREGATE RESULTS
+    # =====================================================
 
-        mean_remaining_hp = float(
-            np.mean(
-                remaining_hp_values
-            )
-        )
+    episode_count = len(
+        episode_rewards
+    )
 
+
+    if episode_count > 0:
         win_rate = (
             wins
-            / args.episodes
+            / episode_count
+            * 100.0
+        )
+
+        timeout_rate = (
+            timeouts
+            / episode_count
+            * 100.0
         )
 
         no_hit_episode_rate = (
             no_hit_episodes
-            / args.episodes
+            / episode_count
+            * 100.0
         )
 
         no_hit_win_rate = (
             no_hit_wins
-            / args.episodes
+            / episode_count
+            * 100.0
         )
 
-        no_hit_rate_among_wins = (
-            no_hit_wins / wins
-            if wins > 0
-            else 0.0
+    else:
+        win_rate = 0.0
+
+        timeout_rate = 0.0
+
+        no_hit_episode_rate = 0.0
+
+        no_hit_win_rate = 0.0
+
+
+    if wins > 0:
+        no_hit_among_wins = (
+            no_hit_wins
+            / wins
+            * 100.0
         )
 
-        # =================================================
-        # Results
-        # =================================================
+    else:
+        no_hit_among_wins = 0.0
 
-        print()
-        print("=" * 60)
-        print("EVALUATION RESULTS")
-        print("=" * 60)
 
+    mean_reward = safe_mean(
+        episode_rewards
+    )
+
+    mean_episode_length = safe_mean(
+        episode_lengths
+    )
+
+    mean_hp_lost = safe_mean(
+        episode_hp_lost
+    )
+
+    mean_remaining_hp = safe_mean(
+        remaining_hp_values
+    )
+
+    mean_successful_exit_length = (
+        safe_mean(
+            successful_exit_lengths
+        )
+    )
+
+
+    # =====================================================
+    # PRINT RESULTS
+    # =====================================================
+
+    print()
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "EVALUATION RESULTS"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        f"Episodes:              "
+        f"{episode_count}"
+    )
+
+    print(
+        f"Wins (room exits):     "
+        f"{wins}"
+    )
+
+    print(
+        f"Deaths:                "
+        f"{deaths}"
+    )
+
+    print(
+        f"Timeouts:              "
+        f"{timeouts}"
+    )
+
+    print(
+        f"Unknown:               "
+        f"{unknowns}"
+    )
+
+    print(
+        f"Win rate:              "
+        f"{win_rate:.1f}%"
+    )
+
+    print(
+        f"Timeout rate:          "
+        f"{timeout_rate:.1f}%"
+    )
+
+    print()
+
+    print(
+        f"Mean reward:           "
+        f"{mean_reward:+.3f}"
+    )
+
+    print(
+        f"Mean episode length:   "
+        f"{mean_episode_length:.1f}"
+    )
+
+    if wins > 0:
         print(
-            f"Episodes:              "
-            f"{args.episodes}"
+            f"Mean winning length:   "
+            f"{mean_successful_exit_length:.1f}"
         )
 
-        print(
-            f"Wins:                  "
-            f"{wins}"
-        )
+    print()
 
-        print(
-            f"Deaths:                "
-            f"{deaths}"
-        )
+    print(
+        f"Mean HP lost:          "
+        f"{mean_hp_lost:.2f}"
+    )
 
-        print(
-            f"Timeouts:              "
-            f"{timeouts}"
-        )
+    print(
+        f"Mean remaining HP:     "
+        f"{mean_remaining_hp:.2f}"
+    )
 
-        print(
-            f"Win rate:              "
-            f"{win_rate:.1%}"
-        )
+    print()
 
-        print()
+    print(
+        f"No-hit episodes:       "
+        f"{no_hit_episodes}"
+    )
 
-        print(
-            f"Mean reward:           "
-            f"{mean_reward:+.3f}"
-        )
+    print(
+        f"No-hit episode rate:   "
+        f"{no_hit_episode_rate:.1f}%"
+    )
 
-        print(
-            f"Mean episode length:   "
-            f"{mean_length:.1f}"
-        )
+    print(
+        f"No-hit wins:           "
+        f"{no_hit_wins}"
+    )
 
-        print()
+    print(
+        f"No-hit win rate:       "
+        f"{no_hit_win_rate:.1f}%"
+    )
 
-        print(
-            f"Mean HP lost:          "
-            f"{mean_hp_lost:.2f}"
-        )
+    print(
+        f"No-hit among wins:     "
+        f"{no_hit_among_wins:.1f}%"
+    )
 
-        print(
-            f"Mean remaining HP:     "
-            f"{mean_remaining_hp:.2f}"
-        )
-
-        print()
-
-        print(
-            f"No-hit episodes:       "
-            f"{no_hit_episodes}"
-        )
-
-        print(
-            f"No-hit episode rate:   "
-            f"{no_hit_episode_rate:.1%}"
-        )
-
-        print(
-            f"No-hit wins:           "
-            f"{no_hit_wins}"
-        )
-
-        print(
-            f"No-hit win rate:       "
-            f"{no_hit_win_rate:.1%}"
-        )
-
-        print(
-            f"No-hit among wins:     "
-            f"{no_hit_rate_among_wins:.1%}"
-        )
-
-        print("=" * 60)
-
-    finally:
-        env.close()
+    print(
+        "=" * 60
+    )
 
 
 if __name__ == "__main__":

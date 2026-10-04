@@ -30,7 +30,6 @@ local HOST = "127.0.0.1"
 local PORT = 5000
 
 -- Isaac updates roughly 30 times/sec.
---
 -- 3 = ~10 observations/sec.
 local STATE_SEND_INTERVAL = 3
 
@@ -53,43 +52,46 @@ local TRAINING_ENEMY_VARIANT = 0
 local TRAINING_ENEMY_SUBTYPE = 0
 
 
--- Possible enemy spawn offsets relative to room center.
---
--- One position is selected randomly for each episode.
 local TRAINING_ENEMY_OFFSETS = {
-
-    -- Right
-    Vector(
-        160,
-        0
-    ),
-
-    -- Left
-    Vector(
-        -160,
-        0
-    ),
-
-    -- Down
-    Vector(
-        0,
-        120
-    ),
-
-    -- Up
-    Vector(
-        0,
-        -120
-    )
-
+    Vector(160, 0),
+    Vector(-160, 0),
+    Vector(0, 120),
+    Vector(0, -120)
 }
 
 
 -- =========================================================
--- RL CONTROL
+-- NAVIGATION
+-- =========================================================
 --
--- Global intentionally so we can also change these
--- from the Isaac debug console.
+-- Navigation now uses two implicit phases:
+--
+-- APPROACH:
+--     Target is inside the room, in front of the doorway.
+--
+-- EXIT:
+--     Once Isaac is aligned with the doorway and has
+--     reached the approach zone, target moves beyond
+--     the doorway.
+--
+-- No door is permanently selected. On every state update
+-- the most convenient door is selected dynamically.
+-- =========================================================
+
+
+-- How far inside the room the approach point sits.
+local DOOR_APPROACH_DISTANCE = 70
+
+-- How far beyond the door the final target sits.
+local DOOR_EXIT_DISTANCE = 90
+
+-- How precisely Isaac must be aligned with the doorway
+-- before target changes from APPROACH to EXIT.
+local DOOR_ALIGNMENT_TOLERANCE = 32
+
+
+-- =========================================================
+-- RL CONTROL
 -- =========================================================
 
 RL_ENABLED = false
@@ -97,14 +99,11 @@ RL_ENABLED = false
 RL_MOVE = "NONE"
 RL_SHOOT = "NONE"
 
--- Last action that has had at least one game update
--- to affect Isaac. Python treats this ID as applied.
+-- Last action which has had at least one game update
+-- in which it could affect Isaac.
 RL_ACTION_ID = 0
 
--- Action received from Python but not yet acknowledged.
 local pendingActionId = nil
-
--- Game frame on which the pending action was received.
 local pendingActionFrame = nil
 
 
@@ -121,6 +120,9 @@ local resetInProgress = false
 local trainingReady = false
 
 local trainingSpawnCountdown = -1
+
+-- Room in which the training encounter started.
+local trainingRoomIndex = nil
 
 
 -- =========================================================
@@ -140,36 +142,18 @@ local txBuffer = ""
 -- =========================================================
 
 local MOVE_ACTIONS = {
-
-    LEFT =
-        ButtonAction.ACTION_LEFT,
-
-    RIGHT =
-        ButtonAction.ACTION_RIGHT,
-
-    UP =
-        ButtonAction.ACTION_UP,
-
-    DOWN =
-        ButtonAction.ACTION_DOWN
-
+    LEFT = ButtonAction.ACTION_LEFT,
+    RIGHT = ButtonAction.ACTION_RIGHT,
+    UP = ButtonAction.ACTION_UP,
+    DOWN = ButtonAction.ACTION_DOWN
 }
 
 
 local SHOOT_ACTIONS = {
-
-    LEFT =
-        ButtonAction.ACTION_SHOOTLEFT,
-
-    RIGHT =
-        ButtonAction.ACTION_SHOOTRIGHT,
-
-    UP =
-        ButtonAction.ACTION_SHOOTUP,
-
-    DOWN =
-        ButtonAction.ACTION_SHOOTDOWN
-
+    LEFT = ButtonAction.ACTION_SHOOTLEFT,
+    RIGHT = ButtonAction.ACTION_SHOOTRIGHT,
+    UP = ButtonAction.ACTION_SHOOTUP,
+    DOWN = ButtonAction.ACTION_SHOOTDOWN
 }
 
 
@@ -198,9 +182,7 @@ Isaac.DebugString(
 -- HELPERS
 -- =========================================================
 
-local function IsValidDirection(
-    value
-)
+local function IsValidDirection(value)
 
     return
         value == "NONE"
@@ -212,13 +194,414 @@ local function IsValidDirection(
 end
 
 
+local function GetCurrentRoomIndex()
+
+    local level = game:GetLevel()
+
+    if level == nil then
+        return -1
+    end
+
+    return level:GetCurrentRoomIndex()
+
+end
+
+
+-- =========================================================
+-- DOOR DIRECTION
+-- =========================================================
+
+local function GetDoorOutwardDirection(slot)
+
+    if slot == DoorSlot.LEFT0
+    or slot == DoorSlot.LEFT1 then
+
+        return Vector(
+            -1,
+            0
+        )
+
+    elseif slot == DoorSlot.RIGHT0
+    or slot == DoorSlot.RIGHT1 then
+
+        return Vector(
+            1,
+            0
+        )
+
+    elseif slot == DoorSlot.UP0
+    or slot == DoorSlot.UP1 then
+
+        return Vector(
+            0,
+            -1
+        )
+
+    elseif slot == DoorSlot.DOWN0
+    or slot == DoorSlot.DOWN1 then
+
+        return Vector(
+            0,
+            1
+        )
+
+    end
+
+
+    return nil
+
+end
+
+
+-- =========================================================
+-- DOOR NAVIGATION DATA
+-- =========================================================
+
+local function GetDoorNavigationData(
+    room,
+    player,
+    slot
+)
+
+    local door =
+        room:GetDoor(
+            slot
+        )
+
+
+    if door == nil then
+        return nil
+    end
+
+
+    local outwardDirection =
+        GetDoorOutwardDirection(
+            slot
+        )
+
+
+    if outwardDirection == nil then
+        return nil
+    end
+
+
+    local doorPosition =
+        room:GetDoorSlotPosition(
+            slot
+        )
+
+
+    -- -----------------------------------------------------
+    -- APPROACH POINT
+    --
+    -- This point sits INSIDE the room.
+    --
+    -- Example for a right-hand door:
+    --
+    --        approach     door       exit
+    --           X          |           X
+    --                      |
+    --     room             | outside
+    --
+    -- -----------------------------------------------------
+
+    local approachPosition =
+        Vector(
+            doorPosition.X
+                - outwardDirection.X
+                * DOOR_APPROACH_DISTANCE,
+
+            doorPosition.Y
+                - outwardDirection.Y
+                * DOOR_APPROACH_DISTANCE
+        )
+
+
+    -- -----------------------------------------------------
+    -- EXIT POINT
+    --
+    -- This point sits BEYOND the doorway.
+    -- -----------------------------------------------------
+
+    local exitPosition =
+        Vector(
+            doorPosition.X
+                + outwardDirection.X
+                * DOOR_EXIT_DISTANCE,
+
+            doorPosition.Y
+                + outwardDirection.Y
+                * DOOR_EXIT_DISTANCE
+        )
+
+
+    local approachDx =
+        approachPosition.X
+        - player.Position.X
+
+
+    local approachDy =
+        approachPosition.Y
+        - player.Position.Y
+
+
+    local approachDistanceSquared =
+        approachDx * approachDx
+        + approachDy * approachDy
+
+
+    -- -----------------------------------------------------
+    -- ALIGNMENT CHECK
+    -- -----------------------------------------------------
+
+    local aligned = false
+
+
+    if outwardDirection.X ~= 0 then
+
+        -- Left/right door.
+        -- Y must line up with doorway.
+        aligned =
+            math.abs(
+                player.Position.Y
+                - doorPosition.Y
+            )
+            <= DOOR_ALIGNMENT_TOLERANCE
+
+    else
+
+        -- Up/down door.
+        -- X must line up with doorway.
+        aligned =
+            math.abs(
+                player.Position.X
+                - doorPosition.X
+            )
+            <= DOOR_ALIGNMENT_TOLERANCE
+
+    end
+
+
+    -- -----------------------------------------------------
+    -- HAS ISAAC REACHED THE APPROACH PLANE?
+    --
+    -- This is deliberately directional rather than
+    -- distance-only.
+    --
+    -- That means once Isaac starts moving through the
+    -- doorway, we do not suddenly switch the target back
+    -- to the point inside the room.
+    -- -----------------------------------------------------
+
+    local reachedApproachPlane = false
+
+
+    if outwardDirection.X > 0 then
+
+        -- Right door
+        reachedApproachPlane =
+            player.Position.X
+            >= approachPosition.X
+
+    elseif outwardDirection.X < 0 then
+
+        -- Left door
+        reachedApproachPlane =
+            player.Position.X
+            <= approachPosition.X
+
+    elseif outwardDirection.Y > 0 then
+
+        -- Down door
+        reachedApproachPlane =
+            player.Position.Y
+            >= approachPosition.Y
+
+    elseif outwardDirection.Y < 0 then
+
+        -- Up door
+        reachedApproachPlane =
+            player.Position.Y
+            <= approachPosition.Y
+
+    end
+
+
+    local navigationPhase =
+        "APPROACH"
+
+
+    local targetPosition =
+        approachPosition
+
+
+    if aligned
+    and reachedApproachPlane then
+
+        navigationPhase =
+            "EXIT"
+
+        targetPosition =
+            exitPosition
+
+    end
+
+
+    return {
+
+        door =
+            door,
+
+        slot =
+            slot,
+
+        phase =
+            navigationPhase,
+
+        target_position =
+            targetPosition,
+
+        approach_position =
+            approachPosition,
+
+        exit_position =
+            exitPosition,
+
+        door_position =
+            doorPosition,
+
+        approach_distance_squared =
+            approachDistanceSquared
+
+    }
+
+end
+
+
+-- =========================================================
+-- FIND BEST NAVIGATION TARGET
+-- =========================================================
+
+local function GetNearestDoorTarget(player)
+
+    local room =
+        game:GetRoom()
+
+
+    if room == nil then
+        return nil
+    end
+
+
+    local bestDoorData = nil
+
+
+    -- -----------------------------------------------------
+    -- IMPORTANT:
+    --
+    -- Doors are NOT fixed for the episode.
+    --
+    -- We calculate the approach point for every actual
+    -- door and select the one whose approach point is
+    -- currently closest to Isaac.
+    -- -----------------------------------------------------
+
+    for slot = 0,
+        DoorSlot.NUM_DOOR_SLOTS - 1 do
+
+
+        local doorData =
+            GetDoorNavigationData(
+                room,
+                player,
+                slot
+            )
+
+
+        if doorData ~= nil then
+
+
+            if bestDoorData == nil
+            or doorData.approach_distance_squared
+                < bestDoorData.approach_distance_squared then
+
+
+                bestDoorData =
+                    doorData
+
+            end
+
+        end
+
+    end
+
+
+    if bestDoorData == nil then
+        return nil
+    end
+
+
+    local targetPosition =
+        bestDoorData.target_position
+
+
+    local approachPosition =
+        bestDoorData.approach_position
+
+
+    local exitPosition =
+        bestDoorData.exit_position
+
+
+    local doorPosition =
+        bestDoorData.door_position
+
+
+    return {
+
+        x =
+            targetPosition.X,
+
+        y =
+            targetPosition.Y,
+
+        phase =
+            bestDoorData.phase,
+
+        slot =
+            bestDoorData.slot,
+
+        door_x =
+            doorPosition.X,
+
+        door_y =
+            doorPosition.Y,
+
+        approach_x =
+            approachPosition.X,
+
+        approach_y =
+            approachPosition.Y,
+
+        exit_x =
+            exitPosition.X,
+
+        exit_y =
+            exitPosition.Y,
+
+        target_room_index =
+            bestDoorData.door.TargetRoomIndex
+
+    }
+
+end
+
+
 -- =========================================================
 -- DISCONNECT
 -- =========================================================
 
-local function DisconnectPython(
-    reason
-)
+local function DisconnectPython(reason)
 
     if tcp ~= nil then
 
@@ -295,7 +678,6 @@ local function ConnectToPython()
     end
 
 
-    -- Small timeout only for connect().
     client:settimeout(
         0.05
     )
@@ -321,7 +703,6 @@ local function ConnectToPython()
             ""
 
 
-        -- Non-blocking after connection.
         tcp:settimeout(
             0
         )
@@ -334,6 +715,76 @@ local function ConnectToPython()
     else
 
         client:close()
+
+    end
+
+end
+
+
+-- =========================================================
+-- TRAINING ROOM DOORS
+-- =========================================================
+
+local function CloseTrainingRoomDoors()
+
+    local room =
+        game:GetRoom()
+
+
+    if room == nil then
+        return
+    end
+
+
+    for slot = 0,
+        DoorSlot.NUM_DOOR_SLOTS - 1 do
+
+
+        local door =
+            room:GetDoor(
+                slot
+            )
+
+
+        if door ~= nil then
+
+            door:Close(
+                true
+            )
+
+        end
+
+    end
+
+end
+
+
+local function OpenTrainingRoomDoors()
+
+    local room =
+        game:GetRoom()
+
+
+    if room == nil then
+        return
+    end
+
+
+    for slot = 0,
+        DoorSlot.NUM_DOOR_SLOTS - 1 do
+
+
+        local door =
+            room:GetDoor(
+                slot
+            )
+
+
+        if door ~= nil then
+
+            door:Open()
+
+        end
 
     end
 
@@ -359,7 +810,6 @@ local function SpawnTrainingEnemy()
         room:GetCenterPos()
 
 
-    -- Pick one of the configured spawn positions.
     local offsetIndex =
         (
             Random()
@@ -416,14 +866,25 @@ local function SpawnTrainingEnemy()
     end
 
 
+    trainingRoomIndex =
+        GetCurrentRoomIndex()
+
+
     trainingReady =
         true
+
+
+    CloseTrainingRoomDoors()
 
 
     Isaac.DebugString(
         "RL_TRAINING READY episode="
         .. tostring(
             episodeId
+        )
+        .. " room="
+        .. tostring(
+            trainingRoomIndex
         )
         .. " spawn_index="
         .. tostring(
@@ -433,44 +894,6 @@ local function SpawnTrainingEnemy()
 
 
     return true
-
-end
-
-
--- =========================================================
--- CLOSE TRAINING ROOM DOORS
--- =========================================================
-
-local function CloseTrainingRoomDoors()
-
-    local room =
-        game:GetRoom()
-
-
-    if room == nil then
-        return
-    end
-
-
-    for slot = 0,
-        DoorSlot.NUM_DOOR_SLOTS - 1 do
-
-
-        local door =
-            room:GetDoor(
-                slot
-            )
-
-
-        if door ~= nil then
-
-            door:Close(
-                true
-            )
-
-        end
-
-    end
 
 end
 
@@ -492,6 +915,10 @@ local function RequestReset()
 
     trainingReady =
         false
+
+
+    trainingRoomIndex =
+        nil
 
 
     gameOver =
@@ -534,9 +961,7 @@ end
 -- COMMAND FROM PYTHON
 -- =========================================================
 
-local function ProcessCommand(
-    line
-)
+local function ProcessCommand(line)
 
     local success, command =
         pcall(
@@ -661,7 +1086,7 @@ local function ProcessCommand(
 
 
     -- =====================================================
-    -- SHOOT
+    -- SHOOTING
     -- =====================================================
 
     if command.shoot
@@ -719,10 +1144,6 @@ local function ReadPythonCommands()
             )
 
 
-        -- =================================================
-        -- COMPLETE MESSAGE
-        -- =================================================
-
         if line ~= nil then
 
 
@@ -747,10 +1168,6 @@ local function ReadPythonCommands()
 
         else
 
-
-            -- =============================================
-            -- PARTIAL TCP MESSAGE
-            -- =============================================
 
             if partial ~= nil
             and #partial > 0 then
@@ -777,10 +1194,6 @@ local function ReadPythonCommands()
 
             end
 
-
-            -- =============================================
-            -- NOTHING AVAILABLE
-            -- =============================================
 
             if err
                 == "timeout" then
@@ -835,11 +1248,8 @@ local function FlushOutgoing()
     end
 
 
-    if txBuffer
-        == "" then
-
+    if txBuffer == "" then
         return
-
     end
 
 
@@ -851,8 +1261,7 @@ local function FlushOutgoing()
 
     if sent ~= nil then
 
-        txBuffer =
-            ""
+        txBuffer = ""
 
         return
 
@@ -897,7 +1306,6 @@ local function FlushOutgoing()
 
     if err ~= nil then
 
-
         DisconnectPython(
             err
         )
@@ -908,7 +1316,7 @@ end
 
 
 -- =========================================================
--- BUILD OBSERVATION
+-- BUILD STATE
 -- =========================================================
 
 local function GetGameState()
@@ -926,6 +1334,11 @@ local function GetGameState()
 
     local room =
         game:GetRoom()
+
+
+    if room == nil then
+        return nil
+    end
 
 
     local enemies =
@@ -1007,6 +1420,32 @@ local function GetGameState()
         room:GetCenterPos()
 
 
+    local currentRoomIndex =
+        GetCurrentRoomIndex()
+
+
+    -- =====================================================
+    -- NAVIGATION TARGET
+    -- =====================================================
+
+    local navigationTarget =
+        nil
+
+
+    if room:IsClear()
+    and trainingRoomIndex ~= nil
+    and currentRoomIndex
+        == trainingRoomIndex then
+
+
+        navigationTarget =
+            GetNearestDoorTarget(
+                player
+            )
+
+    end
+
+
     -- =====================================================
     -- STATE
     -- =====================================================
@@ -1035,6 +1474,14 @@ local function GetGameState()
 
         room_frame =
             room:GetFrameCount(),
+
+
+        room_index =
+            currentRoomIndex,
+
+
+        training_room_index =
+            trainingRoomIndex,
 
 
         dead =
@@ -1095,6 +1542,10 @@ local function GetGameState()
             totalEnemyHp,
 
 
+        navigation_target =
+            navigationTarget,
+
+
         control = {
 
             enabled =
@@ -1117,20 +1568,18 @@ end
 
 
 -- =========================================================
--- QUEUE OBSERVATION
+-- QUEUE STATE
 -- =========================================================
 
-local function QueueState(
-    state
-)
+local function QueueState(state)
 
     if tcp == nil then
         return
     end
 
 
-    -- Prefer latest observation instead of building
-    -- a giant queue of old observations.
+    -- Prefer the newest observation instead of building
+    -- a queue of stale observations.
     if txBuffer ~= "" then
         return
     end
@@ -1184,6 +1633,10 @@ function mod:OnGameStarted(
 
     trainingReady =
         false
+
+
+    trainingRoomIndex =
+        nil
 
 
     trainingSpawnCountdown =
@@ -1347,10 +1800,36 @@ function mod:OnUpdate()
 
 
     -- =====================================================
-    -- KEEP AGENT INSIDE TRAINING ROOM
+    -- TRAINING ROOM DOORS
     -- =====================================================
 
-    CloseTrainingRoomDoors()
+    local currentRoomIndex =
+        GetCurrentRoomIndex()
+
+
+    if trainingRoomIndex ~= nil
+    and currentRoomIndex
+        == trainingRoomIndex then
+
+
+        local room =
+            game:GetRoom()
+
+
+        if room:IsClear() then
+
+            -- Combat finished.
+            -- Navigation stage starts.
+            OpenTrainingRoomDoors()
+
+        else
+
+            -- Combat still active.
+            CloseTrainingRoomDoors()
+
+        end
+
+    end
 
 
     local frame =
@@ -1375,7 +1854,6 @@ function mod:OnUpdate()
             QueueState(
                 state
             )
-
 
             FlushOutgoing()
 
@@ -1433,9 +1911,7 @@ mod:AddCallback(
 -- INPUT HELPERS
 -- =========================================================
 
-local function IsMovementButton(
-    button
-)
+local function IsMovementButton(button)
 
     return
         button
@@ -1453,9 +1929,7 @@ local function IsMovementButton(
 end
 
 
-local function IsShootingButton(
-    button
-)
+local function IsShootingButton(button)
 
     return
         button
@@ -1559,13 +2033,9 @@ function mod:OnInput(
 
 
             if pressed then
-
                 return 1.0
-
             else
-
                 return 0.0
-
             end
 
         end
@@ -1615,13 +2085,9 @@ function mod:OnInput(
 
 
             if pressed then
-
                 return 1.0
-
             else
-
                 return 0.0
-
             end
 
         end

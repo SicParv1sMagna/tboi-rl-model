@@ -41,35 +41,79 @@ SHOOT_NAMES = (
 
 
 # =========================================================
-# REWARD CONFIG
+# STEP / TIME REWARD
 # =========================================================
 
-STEP_PENALTY = -0.01
+# Combat is deliberately a little more expensive than
+# navigation.
+#
+# This discourages the old strategy:
+#
+#   stand near a door
+#   shoot in one direction
+#   wait for the enemy to walk into tears
+#
+COMBAT_STEP_PENALTY = -0.03
+
+NAVIGATION_STEP_PENALTY = -0.01
+
+
+# =========================================================
+# ROOM OVERTIME
+# =========================================================
+
+# For the first 100 agent actions in each room, there is no
+# additional overtime penalty.
+ROOM_OVERTIME_START = 100
+
+# After that, the extra cost grows smoothly:
+#
+# step 101 -> -0.001 extra
+# step 120 -> -0.020 extra
+# step 150 -> -0.050 extra
+#
+ROOM_OVERTIME_PENALTY_GROWTH = 0.001
+
+# Never exceed this additional per-step room penalty.
+MAX_ROOM_OVERTIME_PENALTY = 0.05
+
+
+# =========================================================
+# COMBAT REWARD
+# =========================================================
 
 DAMAGE_DEALT_REWARD = 0.05
 
 KILL_REWARD = 3.0
 
-# Clearing the room is useful, but it is no longer
-# the end of the episode.
 ROOM_CLEAR_REWARD = 10.0
 
 HP_LOST_PENALTY = 5.0
 
-# Actual transition into another room.
-ROOM_EXIT_REWARD = 20.0
 
-# Reward remaining HP only after completing the whole
-# combat + navigation task.
-EXIT_HP_BONUS_MULTIPLIER = 1.5
+# =========================================================
+# NAVIGATION / PROGRESS REWARD
+# =========================================================
 
-# Reward per pixel of progress toward the exit target.
+# Reward for completing a NEW unique combat room.
 #
-# The target supplied by Lua is now BEYOND the door.
+# Backtracking through an already completed room does not
+# increase the Lua progress counter, therefore it receives
+# no room completion reward.
+ROOM_EXIT_REWARD = 10.0
+
+TRAINING_COMPLETE_REWARD = 20.0
+
+FINAL_HP_BONUS_MULTIPLIER = 1.5
+
 NAVIGATION_PROGRESS_REWARD = 0.01
 
-# Avoid unusually large shaping values.
 MAX_NAVIGATION_PROGRESS_REWARD = 0.5
+
+
+# =========================================================
+# FAILURE
+# =========================================================
 
 DEATH_PENALTY = -25.0
 
@@ -78,7 +122,8 @@ TIMEOUT_PENALTY = -2.0
 
 class IsaacEnv(gym.Env):
     """
-    Gymnasium environment for The Binding of Isaac: Afterbirth+.
+    Multi-room RL environment for
+    The Binding of Isaac: Afterbirth+.
 
     Action:
         [move, shoot]
@@ -90,34 +135,38 @@ class IsaacEnv(gym.Env):
         4 = DOWN
 
     Observation:
-        13 normalized float values.
+        13 float values.
 
         0  player relative x
         1  player relative y
+
         2  player velocity x
         3  player velocity y
+
         4  red hearts
         5  soul hearts
 
         6  target dx
         7  target dy
+
         8  target velocity x
         9  target velocity y
+
         10 target hp fraction
 
         11 enemy count
+
         12 room clear
 
     Target semantics:
 
-        room_clear == 0
-            target = nearest enemy
+        room_clear == 0:
+            nearest enemy
 
-        room_clear == 1
-            target = navigation target beyond
-                     the nearest exit door
+        room_clear == 1:
+            navigation waypoint / exit target
 
-    The observation shape remains 13 so old PPO
+    Observation remains shape=(13,), so previous PPO
     checkpoints remain compatible.
     """
 
@@ -193,6 +242,8 @@ class IsaacEnv(gym.Env):
         ) = None
 
         self._episode_steps = 0
+
+        self._room_steps = 0
 
         self._action_id = 0
 
@@ -315,6 +366,7 @@ class IsaacEnv(gym.Env):
 
         except OSError:
             self._drop_connection()
+
             raise
 
     # =====================================================
@@ -342,6 +394,7 @@ class IsaacEnv(gym.Env):
 
             except OSError:
                 self._drop_connection()
+
                 raise
 
             if not chunk:
@@ -360,8 +413,7 @@ class IsaacEnv(gym.Env):
                 self._rx_buffer = b""
 
                 raise RuntimeError(
-                    "TCP receive buffer "
-                    "overflow."
+                    "TCP receive buffer overflow."
                 )
 
         line, self._rx_buffer = (
@@ -508,37 +560,54 @@ class IsaacEnv(gym.Env):
         )
 
     @staticmethod
-    def _training_room_index(
+    def _rooms_completed(
         state: dict[str, Any],
     ) -> int:
+        # New explicit name.
+        if "rooms_completed" in state:
+            return int(
+                state.get(
+                    "rooms_completed",
+                    0,
+                )
+            )
+
+        # Compatibility with previous main.lua.
         return int(
             state.get(
-                "training_room_index",
-                -1,
+                "rooms_exited",
+                0,
             )
         )
 
-    def _has_exited_training_room(
-        self,
+    @staticmethod
+    def _target_room_count(
+        state: dict[str, Any],
+    ) -> int:
+        if "target_training_rooms" in state:
+            return int(
+                state.get(
+                    "target_training_rooms",
+                    3,
+                )
+            )
+
+        return int(
+            state.get(
+                "target_room_exits",
+                3,
+            )
+        )
+
+    @staticmethod
+    def _training_complete(
         state: dict[str, Any],
     ) -> bool:
-        room_index = (
-            self._room_index(
-                state
+        return bool(
+            state.get(
+                "training_complete",
+                False,
             )
-        )
-
-        training_room_index = (
-            self._training_room_index(
-                state
-            )
-        )
-
-        return (
-            room_index >= 0
-            and training_room_index >= 0
-            and room_index
-            != training_room_index
         )
 
     # =====================================================
@@ -570,6 +639,34 @@ class IsaacEnv(gym.Env):
         )
 
     # =====================================================
+    # ROOM TRANSITION
+    # =====================================================
+
+    def _room_transitioned(
+        self,
+        previous: dict[str, Any],
+        current: dict[str, Any],
+    ) -> bool:
+        previous_room = (
+            self._room_index(
+                previous
+            )
+        )
+
+        current_room = (
+            self._room_index(
+                current
+            )
+        )
+
+        return (
+            previous_room >= 0
+            and current_room >= 0
+            and previous_room
+            != current_room
+        )
+
+    # =====================================================
     # NAVIGATION
     # =====================================================
 
@@ -577,23 +674,16 @@ class IsaacEnv(gym.Env):
         self,
         state: dict[str, Any],
     ) -> float | None:
-        """
-        Distance from Isaac to the exit target.
-
-        Lua places the exit target beyond the nearest
-        doorway rather than directly on the door.
-        """
+        if self._training_complete(
+            state
+        ):
+            return None
 
         if not bool(
             state.get(
                 "room_clear",
                 False,
             )
-        ):
-            return None
-
-        if self._has_exited_training_room(
-            state
         ):
             return None
 
@@ -730,7 +820,7 @@ class IsaacEnv(gym.Env):
         )
 
         # -------------------------------------------------
-        # Target
+        # Shared target channels
         # -------------------------------------------------
 
         target_dx = 0.0
@@ -742,7 +832,7 @@ class IsaacEnv(gym.Env):
         target_hp_fraction = 0.0
 
         # -------------------------------------------------
-        # Navigation target
+        # NAVIGATION TARGET
         # -------------------------------------------------
 
         if room_clear:
@@ -777,7 +867,7 @@ class IsaacEnv(gym.Env):
                 )
 
         # -------------------------------------------------
-        # Combat target
+        # COMBAT TARGET
         # -------------------------------------------------
 
         else:
@@ -892,10 +982,10 @@ class IsaacEnv(gym.Env):
         )
 
         # -------------------------------------------------
-        # Build observation
+        # Observation
         # -------------------------------------------------
 
-        observation = np.array(
+        return np.array(
             [
                 self._clip(
                     (px - center_x)
@@ -964,8 +1054,6 @@ class IsaacEnv(gym.Env):
             dtype=np.float32,
         )
 
-        return observation
-
     # =====================================================
     # REWARD
     # =====================================================
@@ -974,15 +1062,61 @@ class IsaacEnv(gym.Env):
         self,
         previous: dict[str, Any],
         current: dict[str, Any],
+        *,
+        room_steps: int,
     ) -> tuple[
         float,
         bool,
         dict[str, Any],
     ]:
-        reward = STEP_PENALTY
+        # -------------------------------------------------
+        # PHASE-DEPENDENT STEP PENALTY
+        # -------------------------------------------------
+
+        navigation_mode = bool(
+            previous.get(
+                "room_clear",
+                False,
+            )
+        )
+
+        if navigation_mode:
+            step_penalty = (
+                NAVIGATION_STEP_PENALTY
+            )
+
+        else:
+            step_penalty = (
+                COMBAT_STEP_PENALTY
+            )
+
+
+        reward = (
+            step_penalty
+        )
 
         # -------------------------------------------------
-        # Enemy damage
+        # ROOM OVERTIME
+        # -------------------------------------------------
+
+        overtime_steps = max(
+            0,
+            room_steps
+            - ROOM_OVERTIME_START,
+        )
+
+        room_overtime_penalty = min(
+            MAX_ROOM_OVERTIME_PENALTY,
+            overtime_steps
+            * ROOM_OVERTIME_PENALTY_GROWTH,
+        )
+
+        reward -= (
+            room_overtime_penalty
+        )
+
+        # -------------------------------------------------
+        # ENEMY DAMAGE
         # -------------------------------------------------
 
         previous_enemy_hp = float(
@@ -1015,7 +1149,7 @@ class IsaacEnv(gym.Env):
         )
 
         # -------------------------------------------------
-        # Enemy kills
+        # KILLS
         # -------------------------------------------------
 
         previous_enemy_count = int(
@@ -1048,7 +1182,7 @@ class IsaacEnv(gym.Env):
         )
 
         # -------------------------------------------------
-        # Player damage
+        # PLAYER DAMAGE
         # -------------------------------------------------
 
         previous_hp = (
@@ -1079,7 +1213,7 @@ class IsaacEnv(gym.Env):
         )
 
         # -------------------------------------------------
-        # Combat completion
+        # ROOM CLEAR
         # -------------------------------------------------
 
         enemy_defeated = (
@@ -1100,7 +1234,7 @@ class IsaacEnv(gym.Env):
             )
 
         # -------------------------------------------------
-        # Navigation progress
+        # NAVIGATION PROGRESS
         # -------------------------------------------------
 
         previous_navigation_distance = (
@@ -1151,40 +1285,100 @@ class IsaacEnv(gym.Env):
             )
 
         # -------------------------------------------------
-        # Successful room exit
+        # ACTUAL ROOM TRANSITION
         # -------------------------------------------------
 
-        exited_training_room = (
-            self._has_exited_training_room(
+        room_transitioned = (
+            self._room_transitioned(
+                previous,
+                current,
+            )
+        )
+
+        # -------------------------------------------------
+        # UNIQUE CURRICULUM PROGRESS
+        # -------------------------------------------------
+
+        previous_rooms_completed = (
+            self._rooms_completed(
+                previous
+            )
+        )
+
+        current_rooms_completed = (
+            self._rooms_completed(
                 current
             )
         )
 
-        exit_reward = 0.0
+        rooms_completed_delta = max(
+            0,
+            current_rooms_completed
+            - previous_rooms_completed,
+        )
 
-        exit_health_bonus = 0.0
+        room_exit_reward = (
+            rooms_completed_delta
+            * ROOM_EXIT_REWARD
+        )
+
+        reward += (
+            room_exit_reward
+        )
+
+        # A transition with no progress means we entered
+        # an already-completed room.
+        backtracked = (
+            room_transitioned
+            and rooms_completed_delta == 0
+        )
+
+        # -------------------------------------------------
+        # FULL TASK COMPLETE
+        # -------------------------------------------------
+
+        training_complete = (
+            self._training_complete(
+                current
+            )
+        )
+
+        was_training_complete = (
+            self._training_complete(
+                previous
+            )
+        )
+
+        completed_this_step = (
+            training_complete
+            and not was_training_complete
+        )
+
+        training_complete_reward = 0.0
+
+        final_health_bonus = 0.0
 
 
-        if exited_training_room:
-            exit_reward = (
-                ROOM_EXIT_REWARD
+        if completed_this_step:
+            training_complete_reward = (
+                TRAINING_COMPLETE_REWARD
             )
 
             reward += (
-                exit_reward
+                training_complete_reward
             )
 
-            exit_health_bonus = (
+            final_health_bonus = (
                 current_hp
-                * EXIT_HP_BONUS_MULTIPLIER
+                * FINAL_HP_BONUS_MULTIPLIER
             )
 
             reward += (
-                exit_health_bonus
+                final_health_bonus
             )
 
         # -------------------------------------------------
-        # Death
+        # DEATH
         # -------------------------------------------------
 
         dead = bool(
@@ -1205,26 +1399,34 @@ class IsaacEnv(gym.Env):
             )
 
         # -------------------------------------------------
-        # Termination
+        # TERMINATION
         # -------------------------------------------------
-
-        # Killing the enemy is NOT the end anymore.
-        #
-        # Episode ends only when:
-        #
-        # 1. Isaac dies
-        # 2. Isaac leaves the training room
 
         terminated = (
             dead
-            or exited_training_room
+            or training_complete
         )
 
         # -------------------------------------------------
-        # Info
+        # INFO
         # -------------------------------------------------
 
         info = {
+            "navigation_mode":
+                navigation_mode,
+
+            "step_penalty":
+                step_penalty,
+
+            "room_steps_for_reward":
+                room_steps,
+
+            "overtime_steps":
+                overtime_steps,
+
+            "room_overtime_penalty":
+                room_overtime_penalty,
+
             "damage_dealt":
                 damage_dealt,
 
@@ -1258,14 +1460,48 @@ class IsaacEnv(gym.Env):
             "navigation_progress_reward":
                 navigation_progress_reward,
 
-            "exited_training_room":
-                exited_training_room,
+            "room_transitioned":
+                room_transitioned,
 
-            "exit_reward":
-                exit_reward,
+            "backtracked":
+                backtracked,
 
-            "exit_health_bonus":
-                exit_health_bonus,
+            "rooms_completed_delta":
+                rooms_completed_delta,
+
+            # Compatibility with previous evaluation code.
+            "room_exits_delta":
+                rooms_completed_delta,
+
+            "exited_room_this_step":
+                room_transitioned,
+
+            "room_exit_reward":
+                room_exit_reward,
+
+            "rooms_completed":
+                current_rooms_completed,
+
+            # Compatibility alias.
+            "rooms_exited":
+                current_rooms_completed,
+
+            "target_room_exits":
+                self._target_room_count(
+                    current
+                ),
+
+            "training_complete":
+                training_complete,
+
+            "completed_this_step":
+                completed_this_step,
+
+            "training_complete_reward":
+                training_complete_reward,
+
+            "final_health_bonus":
+                final_health_bonus,
 
             "dead":
                 dead,
@@ -1300,7 +1536,7 @@ class IsaacEnv(gym.Env):
         self._ensure_connection()
 
         # -------------------------------------------------
-        # Establish baseline episode
+        # Baseline episode
         # -------------------------------------------------
 
         if self._last_state is None:
@@ -1345,7 +1581,7 @@ class IsaacEnv(gym.Env):
 
 
         # -------------------------------------------------
-        # Wait for the next training episode
+        # Wait for first controlled enemy
         # -------------------------------------------------
 
         new_state = (
@@ -1371,6 +1607,10 @@ class IsaacEnv(gym.Env):
                         )
                     )
                     > 0
+                    and self._rooms_completed(
+                        state
+                    )
+                    == 0
                 ),
                 timeout=20.0,
             )
@@ -1382,6 +1622,8 @@ class IsaacEnv(gym.Env):
         )
 
         self._episode_steps = 0
+
+        self._room_steps = 0
 
         self._action_id = 0
 
@@ -1403,22 +1645,20 @@ class IsaacEnv(gym.Env):
 
         info["episode_steps"] = 0
 
+        info["room_steps"] = 0
+
         info["episode_hp_lost"] = 0.0
 
         info["no_hit"] = True
 
-        info["exited_training_room"] = (
-            False
-        )
-
-        info["forced_shoot_none"] = (
-            False
-        )
+        info["timeout"] = False
 
 
         print(
             "[IsaacEnv] Episode "
-            f"{info['episode_id']} ready."
+            f"{info['episode_id']} ready. "
+            f"Target rooms: "
+            f"{info['target_room_exits']}"
         )
 
 
@@ -1512,15 +1752,7 @@ class IsaacEnv(gym.Env):
 
 
         # -------------------------------------------------
-        # NAVIGATION MODE
-        # -------------------------------------------------
-        #
-        # Once the room is clear, shooting has no useful
-        # purpose in this curriculum stage.
-        #
-        # We intentionally keep the original action space
-        # so old PPO checkpoints remain compatible, but
-        # physically ignore the shoot component here.
+        # Navigation mode
         # -------------------------------------------------
 
         navigation_mode = bool(
@@ -1530,11 +1762,13 @@ class IsaacEnv(gym.Env):
             )
         )
 
-
         forced_shoot_none = False
 
 
         if navigation_mode:
+            # Keep action space compatible with older PPO
+            # checkpoints but physically ignore shooting
+            # during navigation.
             shoot_name = "NONE"
 
             forced_shoot_none = True
@@ -1577,7 +1811,7 @@ class IsaacEnv(gym.Env):
         )
 
         # -------------------------------------------------
-        # Wait for state after action
+        # Wait for applied action
         # -------------------------------------------------
 
         new_state = (
@@ -1603,6 +1837,18 @@ class IsaacEnv(gym.Env):
         )
 
         # -------------------------------------------------
+        # Step counters
+        # -------------------------------------------------
+
+        self._episode_steps += 1
+
+        self._room_steps += 1
+
+        room_steps_for_reward = (
+            self._room_steps
+        )
+
+        # -------------------------------------------------
         # Reward
         # -------------------------------------------------
 
@@ -1613,14 +1859,14 @@ class IsaacEnv(gym.Env):
         ) = self._calculate_reward(
             self._last_state,
             new_state,
+            room_steps=(
+                room_steps_for_reward
+            ),
         )
 
         # -------------------------------------------------
-        # Episode statistics
+        # HP statistics
         # -------------------------------------------------
-
-        self._episode_steps += 1
-
 
         self._episode_hp_lost += float(
             reward_info[
@@ -1629,7 +1875,29 @@ class IsaacEnv(gym.Env):
         )
 
         # -------------------------------------------------
-        # Timeout
+        # Room timer reset
+        # -------------------------------------------------
+        #
+        # Reset on EVERY actual transition, including
+        # backtracking, because overtime is defined per
+        # physical room stay rather than per curriculum
+        # progress unit.
+        # -------------------------------------------------
+
+        completed_room_steps = None
+
+
+        if reward_info[
+            "room_transitioned"
+        ]:
+            completed_room_steps = (
+                self._room_steps
+            )
+
+            self._room_steps = 0
+
+        # -------------------------------------------------
+        # Episode timeout
         # -------------------------------------------------
 
         truncated = (
@@ -1647,7 +1915,7 @@ class IsaacEnv(gym.Env):
             )
 
         # -------------------------------------------------
-        # Store current state
+        # Store state
         # -------------------------------------------------
 
         self._last_state = (
@@ -1682,6 +1950,16 @@ class IsaacEnv(gym.Env):
         )
 
 
+        info["room_steps"] = (
+            self._room_steps
+        )
+
+
+        info["completed_room_steps"] = (
+            completed_room_steps
+        )
+
+
         info["episode_hp_lost"] = (
             self._episode_hp_lost
         )
@@ -1696,11 +1974,6 @@ class IsaacEnv(gym.Env):
         info["timeout"] = bool(
             truncated
             and not terminated
-        )
-
-
-        info["navigation_mode"] = (
-            navigation_mode
         )
 
 
@@ -1762,6 +2035,54 @@ class IsaacEnv(gym.Env):
         )
 
 
+        rooms_completed = (
+            self._rooms_completed(
+                state
+            )
+        )
+
+
+        target_room_count = (
+            self._target_room_count(
+                state
+            )
+        )
+
+
+        navigation_target = (
+            self._navigation_target(
+                state
+            )
+        )
+
+
+        navigation_phase = None
+
+        navigation_target_room = None
+
+        navigation_target_visited = None
+
+
+        if navigation_target is not None:
+            navigation_phase = (
+                navigation_target.get(
+                    "phase"
+                )
+            )
+
+            navigation_target_room = (
+                navigation_target.get(
+                    "target_room_index"
+                )
+            )
+
+            navigation_target_visited = (
+                navigation_target.get(
+                    "target_room_visited"
+                )
+            )
+
+
         return {
             "episode_id":
                 int(
@@ -1781,11 +2102,6 @@ class IsaacEnv(gym.Env):
 
             "room_index":
                 self._room_index(
-                    state
-                ),
-
-            "training_room_index":
-                self._training_room_index(
                     state
                 ),
 
@@ -1820,6 +2136,45 @@ class IsaacEnv(gym.Env):
 
             "navigation_distance":
                 navigation_distance,
+
+            "navigation_phase":
+                navigation_phase,
+
+            "navigation_target_room":
+                navigation_target_room,
+
+            "navigation_target_visited":
+                navigation_target_visited,
+
+            "rooms_completed":
+                rooms_completed,
+
+            # Compatibility with evaluate.py.
+            "rooms_exited":
+                rooms_completed,
+
+            "target_room_exits":
+                target_room_count,
+
+            "rooms_remaining":
+                max(
+                    0,
+                    target_room_count
+                    - rooms_completed,
+                ),
+
+            "total_room_transitions":
+                int(
+                    state.get(
+                        "total_room_transitions",
+                        0,
+                    )
+                ),
+
+            "training_complete":
+                self._training_complete(
+                    state
+                ),
         }
 
     # =====================================================
@@ -1867,6 +2222,10 @@ class IsaacEnv(gym.Env):
             f"frame={info['frame']} "
             f"room={info['room_index']} "
             f"mode={mode} "
+            f"progress="
+            f"{info['rooms_completed']}/"
+            f"{info['target_room_exits']} "
+            f"room_steps={self._room_steps} "
             f"hp={info['player_hp']:.1f} "
             f"enemies={info['enemy_count']} "
             f"move={control.get('move')} "

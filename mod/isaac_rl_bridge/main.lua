@@ -29,18 +29,21 @@ local socket = require("socket")
 local HOST = "127.0.0.1"
 local PORT = 5000
 
--- Isaac updates roughly 30 times/sec.
--- 3 = ~10 observations/sec.
+-- Isaac runs at roughly 30 updates/sec.
+-- 3 = roughly 10 observations/sec.
 local STATE_SEND_INTERVAL = 3
 
--- Log once per second.
 local STATE_LOG_INTERVAL = 30
 
--- Retry connection roughly once/sec.
 local RECONNECT_INTERVAL = 30
 
--- Wait several updates after a run starts.
+-- Wait several updates before spawning the controlled
+-- training enemy in a newly entered room.
 local TRAINING_SPAWN_DELAY = 8
+
+-- Number of UNIQUE combat rooms that must be cleared
+-- and exited to complete one episode.
+local TARGET_TRAINING_ROOMS = 3
 
 
 -- =========================================================
@@ -61,33 +64,31 @@ local TRAINING_ENEMY_OFFSETS = {
 
 
 -- =========================================================
--- NAVIGATION
--- =========================================================
---
--- Navigation now uses two implicit phases:
---
--- APPROACH:
---     Target is inside the room, in front of the doorway.
---
--- EXIT:
---     Once Isaac is aligned with the doorway and has
---     reached the approach zone, target moves beyond
---     the doorway.
---
--- No door is permanently selected. On every state update
--- the most convenient door is selected dynamically.
+-- NAVIGATION CONFIG
 -- =========================================================
 
-
--- How far inside the room the approach point sits.
+-- First target:
+-- point INSIDE the room, in front of a doorway.
 local DOOR_APPROACH_DISTANCE = 70
 
--- How far beyond the door the final target sits.
+-- Second target:
+-- point BEYOND the doorway.
 local DOOR_EXIT_DISTANCE = 90
 
--- How precisely Isaac must be aligned with the doorway
--- before target changes from APPROACH to EXIT.
+-- Alignment tolerance with the center of a doorway.
 local DOOR_ALIGNMENT_TOLERANCE = 32
+
+-- Door hysteresis.
+--
+-- A different door must be at least 25% closer than the
+-- currently selected door before we switch to it.
+--
+-- 0.75 means:
+--
+-- current door = 100 px
+-- alternative  = 90 px  -> keep current
+-- alternative  = 70 px  -> switch
+local DOOR_SWITCH_RATIO = 0.75
 
 
 -- =========================================================
@@ -99,7 +100,7 @@ RL_ENABLED = false
 RL_MOVE = "NONE"
 RL_SHOOT = "NONE"
 
--- Last action which has had at least one game update
+-- Last action that has had at least one game update
 -- in which it could affect Isaac.
 RL_ACTION_ID = 0
 
@@ -117,12 +118,66 @@ local gameOver = false
 
 local resetInProgress = false
 
+-- True after the first controlled encounter has spawned.
 local trainingReady = false
+
+-- True while the current room is controlled by the
+-- curriculum.
+--
+-- This can mean either:
+--   combat room
+--   navigation-only revisited room
+local encounterActive = false
+
+-- True after TARGET_TRAINING_ROOMS unique combat rooms
+-- have been successfully completed.
+local trainingComplete = false
 
 local trainingSpawnCountdown = -1
 
--- Room in which the training encounter started.
+-- Current room being controlled.
 local trainingRoomIndex = nil
+
+-- Number of unique combat rooms completed.
+--
+-- We keep the old "rooms_exited" field in the JSON state
+-- for Python compatibility, but semantically this now means
+-- unique training rooms completed.
+local roomsCompleted = 0
+
+-- Number of actual room-to-room transitions.
+--
+-- Diagnostic only. Backtracking increments this number,
+-- but DOES NOT increase roomsCompleted.
+local totalRoomTransitions = 0
+
+-- True after combat is finished and Isaac is currently
+-- expected to navigate through a door.
+local waitingForRoomExit = false
+
+
+-- =========================================================
+-- MAP MEMORY
+-- =========================================================
+
+-- Rooms Isaac has physically entered during this episode.
+local visitedRoomIndices = {}
+
+-- Rooms in which the training enemy was killed and Isaac
+-- successfully exited afterward.
+local completedRoomIndices = {}
+
+
+-- =========================================================
+-- NAVIGATION MEMORY
+-- =========================================================
+
+-- This is NOT a permanently fixed door.
+--
+-- It only provides hysteresis:
+-- keep using the current door until another valid door is
+-- substantially better.
+local navigationDoorSlot = nil
 
 
 -- =========================================================
@@ -170,7 +225,10 @@ Isaac.DebugString(
 )
 
 Isaac.DebugString(
-    "TCP: 127.0.0.1:5000"
+    "TARGET TRAINING ROOMS: "
+    .. tostring(
+        TARGET_TRAINING_ROOMS
+    )
 )
 
 Isaac.DebugString(
@@ -179,7 +237,7 @@ Isaac.DebugString(
 
 
 -- =========================================================
--- HELPERS
+-- GENERIC HELPERS
 -- =========================================================
 
 local function IsValidDirection(value)
@@ -196,13 +254,63 @@ end
 
 local function GetCurrentRoomIndex()
 
-    local level = game:GetLevel()
+    local level =
+        game:GetLevel()
+
 
     if level == nil then
         return -1
     end
 
+
     return level:GetCurrentRoomIndex()
+
+end
+
+
+local function MarkRoomVisited(roomIndex)
+
+    if roomIndex == nil then
+        return
+    end
+
+
+    if roomIndex < 0 then
+        return
+    end
+
+
+    visitedRoomIndices[
+        roomIndex
+    ] = true
+
+end
+
+
+local function IsRoomVisited(roomIndex)
+
+    if roomIndex == nil then
+        return false
+    end
+
+
+    return visitedRoomIndices[
+        roomIndex
+    ] == true
+
+end
+
+
+local function IsRoomCompleted(roomIndex)
+
+    if roomIndex == nil then
+        return false
+    end
+
+
+    return completedRoomIndices[
+        roomIndex
+    ] == true
 
 end
 
@@ -254,345 +362,96 @@ end
 
 
 -- =========================================================
--- DOOR NAVIGATION DATA
+-- DOOR FILTERING
 -- =========================================================
 
-local function GetDoorNavigationData(
-    room,
-    player,
-    slot
-)
-
-    local door =
-        room:GetDoor(
-            slot
-        )
-
+local function IsDirectDoorVariant(door)
 
     if door == nil then
-        return nil
+        return false
     end
 
 
-    local outwardDirection =
-        GetDoorOutwardDirection(
-            slot
-        )
+    local variant =
+        door:GetVariant()
 
 
-    if outwardDirection == nil then
-        return nil
-    end
-
-
-    local doorPosition =
-        room:GetDoorSlotPosition(
-            slot
-        )
-
-
-    -- -----------------------------------------------------
-    -- APPROACH POINT
+    -- We intentionally allow only ordinary/free doors.
     --
-    -- This point sits INSIDE the room.
-    --
-    -- Example for a right-hand door:
-    --
-    --        approach     door       exit
-    --           X          |           X
-    --                      |
-    --     room             | outside
-    --
-    -- -----------------------------------------------------
+    -- Hidden secret-room doors and all locked variants are
+    -- outside the current action space because the agent
+    -- cannot use bombs/keys deliberately yet.
+    if variant
+        ~= DoorVariant.DOOR_UNSPECIFIED
+    and variant
+        ~= DoorVariant.DOOR_UNLOCKED then
 
-    local approachPosition =
-        Vector(
-            doorPosition.X
-                - outwardDirection.X
-                * DOOR_APPROACH_DISTANCE,
-
-            doorPosition.Y
-                - outwardDirection.Y
-                * DOOR_APPROACH_DISTANCE
-        )
-
-
-    -- -----------------------------------------------------
-    -- EXIT POINT
-    --
-    -- This point sits BEYOND the doorway.
-    -- -----------------------------------------------------
-
-    local exitPosition =
-        Vector(
-            doorPosition.X
-                + outwardDirection.X
-                * DOOR_EXIT_DISTANCE,
-
-            doorPosition.Y
-                + outwardDirection.Y
-                * DOOR_EXIT_DISTANCE
-        )
-
-
-    local approachDx =
-        approachPosition.X
-        - player.Position.X
-
-
-    local approachDy =
-        approachPosition.Y
-        - player.Position.Y
-
-
-    local approachDistanceSquared =
-        approachDx * approachDx
-        + approachDy * approachDy
-
-
-    -- -----------------------------------------------------
-    -- ALIGNMENT CHECK
-    -- -----------------------------------------------------
-
-    local aligned = false
-
-
-    if outwardDirection.X ~= 0 then
-
-        -- Left/right door.
-        -- Y must line up with doorway.
-        aligned =
-            math.abs(
-                player.Position.Y
-                - doorPosition.Y
-            )
-            <= DOOR_ALIGNMENT_TOLERANCE
-
-    else
-
-        -- Up/down door.
-        -- X must line up with doorway.
-        aligned =
-            math.abs(
-                player.Position.X
-                - doorPosition.X
-            )
-            <= DOOR_ALIGNMENT_TOLERANCE
+        return false
 
     end
 
 
-    -- -----------------------------------------------------
-    -- HAS ISAAC REACHED THE APPROACH PLANE?
-    --
-    -- This is deliberately directional rather than
-    -- distance-only.
-    --
-    -- That means once Isaac starts moving through the
-    -- doorway, we do not suddenly switch the target back
-    -- to the point inside the room.
-    -- -----------------------------------------------------
-
-    local reachedApproachPlane = false
-
-
-    if outwardDirection.X > 0 then
-
-        -- Right door
-        reachedApproachPlane =
-            player.Position.X
-            >= approachPosition.X
-
-    elseif outwardDirection.X < 0 then
-
-        -- Left door
-        reachedApproachPlane =
-            player.Position.X
-            <= approachPosition.X
-
-    elseif outwardDirection.Y > 0 then
-
-        -- Down door
-        reachedApproachPlane =
-            player.Position.Y
-            >= approachPosition.Y
-
-    elseif outwardDirection.Y < 0 then
-
-        -- Up door
-        reachedApproachPlane =
-            player.Position.Y
-            <= approachPosition.Y
-
-    end
-
-
-    local navigationPhase =
-        "APPROACH"
-
-
-    local targetPosition =
-        approachPosition
-
-
-    if aligned
-    and reachedApproachPlane then
-
-        navigationPhase =
-            "EXIT"
-
-        targetPosition =
-            exitPosition
-
-    end
-
-
-    return {
-
-        door =
-            door,
-
-        slot =
-            slot,
-
-        phase =
-            navigationPhase,
-
-        target_position =
-            targetPosition,
-
-        approach_position =
-            approachPosition,
-
-        exit_position =
-            exitPosition,
-
-        door_position =
-            doorPosition,
-
-        approach_distance_squared =
-            approachDistanceSquared
-
-    }
+    return true
 
 end
 
 
--- =========================================================
--- FIND BEST NAVIGATION TARGET
--- =========================================================
+local function CanOpenDoorWithoutResource(door)
 
-local function GetNearestDoorTarget(player)
-
-    local room =
-        game:GetRoom()
-
-
-    if room == nil then
-        return nil
+    if door == nil then
+        return false
     end
 
 
-    local bestDoorData = nil
+    if not IsDirectDoorVariant(
+        door
+    ) then
+
+        return false
+    end
 
 
-    -- -----------------------------------------------------
-    -- IMPORTANT:
-    --
-    -- Doors are NOT fixed for the episode.
-    --
-    -- We calculate the approach point for every actual
-    -- door and select the one whose approach point is
-    -- currently closest to Isaac.
-    -- -----------------------------------------------------
-
-    for slot = 0,
-        DoorSlot.NUM_DOOR_SLOTS - 1 do
+    if door:IsLocked() then
+        return false
+    end
 
 
-        local doorData =
-            GetDoorNavigationData(
-                room,
-                player,
-                slot
-            )
+    local targetRoomIndex =
+        door.TargetRoomIndex
 
 
-        if doorData ~= nil then
+    if targetRoomIndex == nil
+    or targetRoomIndex < 0 then
 
-
-            if bestDoorData == nil
-            or doorData.approach_distance_squared
-                < bestDoorData.approach_distance_squared then
-
-
-                bestDoorData =
-                    doorData
-
-            end
-
-        end
+        return false
 
     end
 
 
-    if bestDoorData == nil then
-        return nil
+    return true
+
+end
+
+
+local function IsDoorNavigationCandidate(door)
+
+    if not CanOpenDoorWithoutResource(
+        door
+    ) then
+
+        return false
+
     end
 
 
-    local targetPosition =
-        bestDoorData.target_position
+    -- At this point the agent should only target an actual
+    -- currently passable opening.
+    if not door:IsOpen() then
+        return false
+    end
 
 
-    local approachPosition =
-        bestDoorData.approach_position
-
-
-    local exitPosition =
-        bestDoorData.exit_position
-
-
-    local doorPosition =
-        bestDoorData.door_position
-
-
-    return {
-
-        x =
-            targetPosition.X,
-
-        y =
-            targetPosition.Y,
-
-        phase =
-            bestDoorData.phase,
-
-        slot =
-            bestDoorData.slot,
-
-        door_x =
-            doorPosition.X,
-
-        door_y =
-            doorPosition.Y,
-
-        approach_x =
-            approachPosition.X,
-
-        approach_y =
-            approachPosition.Y,
-
-        exit_x =
-            exitPosition.X,
-
-        exit_y =
-            exitPosition.Y,
-
-        target_room_index =
-            bestDoorData.door.TargetRoomIndex
-
-    }
+    return true
 
 end
 
@@ -722,7 +581,7 @@ end
 
 
 -- =========================================================
--- TRAINING ROOM DOORS
+-- DOOR CONTROL
 -- =========================================================
 
 local function CloseTrainingRoomDoors()
@@ -759,7 +618,7 @@ local function CloseTrainingRoomDoors()
 end
 
 
-local function OpenTrainingRoomDoors()
+local function ReleaseTraversableTrainingRoomDoors()
 
     local room =
         game:GetRoom()
@@ -780,13 +639,681 @@ local function OpenTrainingRoomDoors()
             )
 
 
-        if door ~= nil then
+        -- IMPORTANT:
+        --
+        -- Do not blindly Open() every GridEntityDoor.
+        --
+        -- Hidden / locked / special resource-gated doors
+        -- remain untouched.
+        if CanOpenDoorWithoutResource(
+            door
+        ) then
 
             door:Open()
 
         end
 
     end
+
+end
+
+
+-- =========================================================
+-- REMOVE UNCONTROLLED COMBAT
+-- =========================================================
+
+local function RemoveUncontrolledCombatEntities()
+
+    for _, entity
+    in ipairs(
+        Isaac.GetRoomEntities()
+    ) do
+
+
+        if entity:IsActiveEnemy(
+            false
+        ) then
+
+            entity:Remove()
+
+
+        elseif entity.Type
+            == EntityType.ENTITY_PROJECTILE then
+
+            entity:Remove()
+
+        end
+
+    end
+
+end
+
+
+-- =========================================================
+-- PREPARE COMBAT ROOM
+-- =========================================================
+
+local function PrepareTrainingRoom()
+
+    local room =
+        game:GetRoom()
+
+
+    if room == nil then
+        return
+    end
+
+
+    RemoveUncontrolledCombatEntities()
+
+
+    room:SetClear(
+        false
+    )
+
+
+    navigationDoorSlot =
+        nil
+
+
+    waitingForRoomExit =
+        false
+
+
+    CloseTrainingRoomDoors()
+
+end
+
+
+-- =========================================================
+-- PREPARE REVISITED ROOM
+-- =========================================================
+
+local function PrepareNavigationOnlyRoom()
+
+    local room =
+        game:GetRoom()
+
+
+    if room == nil then
+        return
+    end
+
+
+    -- A room already completed earlier should not create
+    -- another combat encounter when we backtrack through it.
+    RemoveUncontrolledCombatEntities()
+
+
+    room:SetClear(
+        true
+    )
+
+
+    encounterActive =
+        true
+
+
+    waitingForRoomExit =
+        true
+
+
+    trainingSpawnCountdown =
+        -1
+
+
+    navigationDoorSlot =
+        nil
+
+
+    ReleaseTraversableTrainingRoomDoors()
+
+
+    Isaac.DebugString(
+        "RL_NAVIGATION ONLY room="
+        .. tostring(
+            GetCurrentRoomIndex()
+        )
+    )
+
+end
+
+
+-- =========================================================
+-- DOOR NAVIGATION DATA
+-- =========================================================
+
+local function GetDoorNavigationData(
+    room,
+    player,
+    slot
+)
+
+    local door =
+        room:GetDoor(
+            slot
+        )
+
+
+    if not IsDoorNavigationCandidate(
+        door
+    ) then
+
+        return nil
+
+    end
+
+
+    local outwardDirection =
+        GetDoorOutwardDirection(
+            slot
+        )
+
+
+    if outwardDirection == nil then
+        return nil
+    end
+
+
+    local doorPosition =
+        room:GetDoorSlotPosition(
+            slot
+        )
+
+
+    -- =====================================================
+    -- APPROACH POINT
+    -- =====================================================
+
+    local approachPosition =
+        Vector(
+
+            doorPosition.X
+                - outwardDirection.X
+                * DOOR_APPROACH_DISTANCE,
+
+            doorPosition.Y
+                - outwardDirection.Y
+                * DOOR_APPROACH_DISTANCE
+
+        )
+
+
+    -- =====================================================
+    -- EXIT POINT
+    -- =====================================================
+
+    local exitPosition =
+        Vector(
+
+            doorPosition.X
+                + outwardDirection.X
+                * DOOR_EXIT_DISTANCE,
+
+            doorPosition.Y
+                + outwardDirection.Y
+                * DOOR_EXIT_DISTANCE
+
+        )
+
+
+    local approachDx =
+        approachPosition.X
+        - player.Position.X
+
+
+    local approachDy =
+        approachPosition.Y
+        - player.Position.Y
+
+
+    local approachDistanceSquared =
+        approachDx * approachDx
+        + approachDy * approachDy
+
+
+    local approachDistance =
+        math.sqrt(
+            approachDistanceSquared
+        )
+
+
+    -- =====================================================
+    -- ALIGNMENT CHECK
+    -- =====================================================
+
+    local aligned = false
+
+
+    if outwardDirection.X ~= 0 then
+
+        -- Left / right doorway.
+        aligned =
+            math.abs(
+                player.Position.Y
+                - doorPosition.Y
+            )
+            <= DOOR_ALIGNMENT_TOLERANCE
+
+    else
+
+        -- Up / down doorway.
+        aligned =
+            math.abs(
+                player.Position.X
+                - doorPosition.X
+            )
+            <= DOOR_ALIGNMENT_TOLERANCE
+
+    end
+
+
+    -- =====================================================
+    -- APPROACH PLANE CHECK
+    -- =====================================================
+
+    local reachedApproachPlane =
+        false
+
+
+    if outwardDirection.X > 0 then
+
+        reachedApproachPlane =
+            player.Position.X
+            >= approachPosition.X
+
+
+    elseif outwardDirection.X < 0 then
+
+        reachedApproachPlane =
+            player.Position.X
+            <= approachPosition.X
+
+
+    elseif outwardDirection.Y > 0 then
+
+        reachedApproachPlane =
+            player.Position.Y
+            >= approachPosition.Y
+
+
+    elseif outwardDirection.Y < 0 then
+
+        reachedApproachPlane =
+            player.Position.Y
+            <= approachPosition.Y
+
+    end
+
+
+    -- =====================================================
+    -- APPROACH / EXIT PHASE
+    -- =====================================================
+
+    local navigationPhase =
+        "APPROACH"
+
+
+    local targetPosition =
+        approachPosition
+
+
+    if aligned
+    and reachedApproachPlane then
+
+        navigationPhase =
+            "EXIT"
+
+
+        targetPosition =
+            exitPosition
+
+    end
+
+
+    local targetRoomIndex =
+        door.TargetRoomIndex
+
+
+    return {
+
+        door =
+            door,
+
+        slot =
+            slot,
+
+        phase =
+            navigationPhase,
+
+        target_position =
+            targetPosition,
+
+        approach_position =
+            approachPosition,
+
+        exit_position =
+            exitPosition,
+
+        door_position =
+            doorPosition,
+
+        approach_distance =
+            approachDistance,
+
+        approach_distance_squared =
+            approachDistanceSquared,
+
+        target_room_index =
+            targetRoomIndex,
+
+        target_room_visited =
+            IsRoomVisited(
+                targetRoomIndex
+            )
+
+    }
+
+end
+
+
+-- =========================================================
+-- DOOR SELECTION WITH HYSTERESIS
+-- =========================================================
+
+local function SelectNavigationDoor(
+    room,
+    player
+)
+
+    local candidates =
+        {}
+
+
+    local bestUnvisited =
+        nil
+
+
+    local bestVisited =
+        nil
+
+
+    local currentCandidate =
+        nil
+
+
+    -- =====================================================
+    -- BUILD VALID CANDIDATES
+    -- =====================================================
+
+    for slot = 0,
+        DoorSlot.NUM_DOOR_SLOTS - 1 do
+
+
+        local doorData =
+            GetDoorNavigationData(
+                room,
+                player,
+                slot
+            )
+
+
+        if doorData ~= nil then
+
+
+            candidates[
+                slot
+            ] = doorData
+
+
+            if slot
+                == navigationDoorSlot then
+
+                currentCandidate =
+                    doorData
+
+            end
+
+
+            if doorData.target_room_visited then
+
+
+                if bestVisited == nil
+                or doorData.approach_distance
+                    < bestVisited.approach_distance then
+
+
+                    bestVisited =
+                        doorData
+
+                end
+
+
+            else
+
+
+                if bestUnvisited == nil
+                or doorData.approach_distance
+                    < bestUnvisited.approach_distance then
+
+
+                    bestUnvisited =
+                        doorData
+
+                end
+
+            end
+
+        end
+
+    end
+
+
+    -- =====================================================
+    -- PREFER UNVISITED ROOMS
+    -- =====================================================
+    --
+    -- This is preference, not prohibition.
+    --
+    -- If no unvisited usable door exists, backtracking is
+    -- still allowed.
+    -- =====================================================
+
+    local bestCandidate =
+        bestUnvisited
+        or bestVisited
+
+
+    if bestCandidate == nil then
+
+        navigationDoorSlot =
+            nil
+
+        return nil
+
+    end
+
+
+    -- =====================================================
+    -- CURRENT DOOR INVALID
+    -- =====================================================
+
+    if currentCandidate == nil then
+
+        navigationDoorSlot =
+            bestCandidate.slot
+
+        return bestCandidate
+
+    end
+
+
+    -- =====================================================
+    -- CURRENT DOOR LEADS TO VISITED ROOM WHILE AN
+    -- UNVISITED ROUTE EXISTS
+    -- =====================================================
+
+    if currentCandidate.target_room_visited
+    and bestUnvisited ~= nil then
+
+        navigationDoorSlot =
+            bestUnvisited.slot
+
+        return bestUnvisited
+
+    end
+
+
+    -- =====================================================
+    -- DETERMINE BEST CANDIDATE IN SAME PRIORITY CLASS
+    -- =====================================================
+
+    local comparisonCandidate =
+        nil
+
+
+    if currentCandidate.target_room_visited then
+
+        comparisonCandidate =
+            bestVisited
+
+    else
+
+        comparisonCandidate =
+            bestUnvisited
+
+    end
+
+
+    if comparisonCandidate == nil then
+
+        return currentCandidate
+
+    end
+
+
+    if comparisonCandidate.slot
+        == currentCandidate.slot then
+
+        return currentCandidate
+
+    end
+
+
+    -- =====================================================
+    -- HYSTERESIS
+    -- =====================================================
+    --
+    -- Alternative must be significantly closer.
+    -- =====================================================
+
+    local switchThreshold =
+        currentCandidate.approach_distance
+        * DOOR_SWITCH_RATIO
+
+
+    if comparisonCandidate.approach_distance
+        < switchThreshold then
+
+
+        navigationDoorSlot =
+            comparisonCandidate.slot
+
+
+        return comparisonCandidate
+
+    end
+
+
+    -- Difference is too small.
+    -- Keep current door.
+    return currentCandidate
+
+end
+
+
+-- =========================================================
+-- GET NAVIGATION TARGET
+-- =========================================================
+
+local function GetNavigationTarget(player)
+
+    local room =
+        game:GetRoom()
+
+
+    if room == nil then
+        return nil
+    end
+
+
+    local selected =
+        SelectNavigationDoor(
+            room,
+            player
+        )
+
+
+    if selected == nil then
+        return nil
+    end
+
+
+    local targetPosition =
+        selected.target_position
+
+
+    local doorPosition =
+        selected.door_position
+
+
+    local approachPosition =
+        selected.approach_position
+
+
+    local exitPosition =
+        selected.exit_position
+
+
+    return {
+
+        x =
+            targetPosition.X,
+
+        y =
+            targetPosition.Y,
+
+        phase =
+            selected.phase,
+
+        slot =
+            selected.slot,
+
+        door_x =
+            doorPosition.X,
+
+        door_y =
+            doorPosition.Y,
+
+        approach_x =
+            approachPosition.X,
+
+        approach_y =
+            approachPosition.Y,
+
+        exit_x =
+            exitPosition.X,
+
+        exit_y =
+            exitPosition.Y,
+
+        target_room_index =
+            selected.target_room_index,
+
+        target_room_visited =
+            selected.target_room_visited
+
+    }
 
 end
 
@@ -804,6 +1331,22 @@ local function SpawnTrainingEnemy()
     if room == nil then
         return false
     end
+
+
+    if trainingComplete then
+        return false
+    end
+
+
+    RemoveUncontrolledCombatEntities()
+
+
+    room:SetClear(
+        false
+    )
+
+
+    CloseTrainingRoomDoors()
 
 
     local center =
@@ -836,22 +1379,24 @@ local function SpawnTrainingEnemy()
         )
 
 
-    room:SetClear(
-        false
-    )
-
-
     local enemy =
         Isaac.Spawn(
+
             TRAINING_ENEMY_TYPE,
+
             TRAINING_ENEMY_VARIANT,
+
             TRAINING_ENEMY_SUBTYPE,
+
             spawnPosition,
+
             Vector(
                 0,
                 0
             ),
+
             nil
+
         )
 
 
@@ -870,21 +1415,44 @@ local function SpawnTrainingEnemy()
         GetCurrentRoomIndex()
 
 
+    MarkRoomVisited(
+        trainingRoomIndex
+    )
+
+
+    encounterActive =
+        true
+
+
+    waitingForRoomExit =
+        false
+
+
+    navigationDoorSlot =
+        nil
+
+
     trainingReady =
         true
 
 
-    CloseTrainingRoomDoors()
-
-
     Isaac.DebugString(
-        "RL_TRAINING READY episode="
+        "RL_ENCOUNTER READY"
+        .. " episode="
         .. tostring(
             episodeId
         )
         .. " room="
         .. tostring(
             trainingRoomIndex
+        )
+        .. " completed="
+        .. tostring(
+            roomsCompleted
+        )
+        .. "/"
+        .. tostring(
+            TARGET_TRAINING_ROOMS
         )
         .. " spawn_index="
         .. tostring(
@@ -917,7 +1485,43 @@ local function RequestReset()
         false
 
 
+    encounterActive =
+        false
+
+
+    trainingComplete =
+        false
+
+
+    waitingForRoomExit =
+        false
+
+
     trainingRoomIndex =
+        nil
+
+
+    roomsCompleted =
+        0
+
+
+    totalRoomTransitions =
+        0
+
+
+    trainingSpawnCountdown =
+        -1
+
+
+    visitedRoomIndices =
+        {}
+
+
+    completedRoomIndices =
+        {}
+
+
+    navigationDoorSlot =
         nil
 
 
@@ -1086,7 +1690,7 @@ local function ProcessCommand(line)
 
 
     -- =====================================================
-    -- SHOOTING
+    -- SHOOT
     -- =====================================================
 
     if command.shoot
@@ -1261,7 +1865,8 @@ local function FlushOutgoing()
 
     if sent ~= nil then
 
-        txBuffer = ""
+        txBuffer =
+            ""
 
         return
 
@@ -1432,18 +2037,28 @@ local function GetGameState()
         nil
 
 
-    if room:IsClear()
+    if encounterActive
+    and not trainingComplete
+    and room:IsClear()
     and trainingRoomIndex ~= nil
     and currentRoomIndex
         == trainingRoomIndex then
 
 
         navigationTarget =
-            GetNearestDoorTarget(
+            GetNavigationTarget(
                 player
             )
 
     end
+
+
+    local roomsRemaining =
+        math.max(
+            0,
+            TARGET_TRAINING_ROOMS
+                - roomsCompleted
+        )
 
 
     -- =====================================================
@@ -1466,6 +2081,39 @@ local function GetGameState()
 
         ready =
             trainingReady,
+
+
+        encounter_active =
+            encounterActive,
+
+
+        training_complete =
+            trainingComplete,
+
+
+        -- Compatibility with existing Python/evaluate.py.
+        rooms_exited =
+            roomsCompleted,
+
+
+        rooms_completed =
+            roomsCompleted,
+
+
+        target_room_exits =
+            TARGET_TRAINING_ROOMS,
+
+
+        target_training_rooms =
+            TARGET_TRAINING_ROOMS,
+
+
+        rooms_remaining =
+            roomsRemaining,
+
+
+        total_room_transitions =
+            totalRoomTransitions,
 
 
         frame =
@@ -1578,8 +2226,7 @@ local function QueueState(state)
     end
 
 
-    -- Prefer the newest observation instead of building
-    -- a queue of stale observations.
+    -- Prefer latest state over a large stale queue.
     if txBuffer ~= "" then
         return
     end
@@ -1611,6 +2258,252 @@ end
 
 
 -- =========================================================
+-- NEW ROOM
+-- =========================================================
+
+function mod:OnNewRoom()
+
+    if resetInProgress then
+        return
+    end
+
+
+    -- Initial room callback can happen before the training
+    -- run is fully initialized.
+    if not trainingReady then
+        return
+    end
+
+
+    if trainingComplete then
+        return
+    end
+
+
+    -- We only consider the transition valid if the previous
+    -- room was actually in navigation mode.
+    if not waitingForRoomExit then
+        return
+    end
+
+
+    local newRoomIndex =
+        GetCurrentRoomIndex()
+
+
+    local previousRoomIndex =
+        trainingRoomIndex
+
+
+    if previousRoomIndex == nil then
+        return
+    end
+
+
+    if newRoomIndex
+        == previousRoomIndex then
+
+        return
+
+    end
+
+
+    -- =====================================================
+    -- ROOM TRANSITION
+    -- =====================================================
+
+    totalRoomTransitions =
+        totalRoomTransitions
+        + 1
+
+
+    MarkRoomVisited(
+        newRoomIndex
+    )
+
+
+    -- =====================================================
+    -- UNIQUE ROOM COMPLETION
+    -- =====================================================
+    --
+    -- Backtracking out of an already completed room does
+    -- NOT increase curriculum progress.
+    -- =====================================================
+
+    if not IsRoomCompleted(
+        previousRoomIndex
+    ) then
+
+
+        completedRoomIndices[
+            previousRoomIndex
+        ] = true
+
+
+        roomsCompleted =
+            roomsCompleted
+            + 1
+
+
+        Isaac.DebugString(
+            "RL_ROOM COMPLETE "
+            .. tostring(
+                roomsCompleted
+            )
+            .. "/"
+            .. tostring(
+                TARGET_TRAINING_ROOMS
+            )
+            .. " room="
+            .. tostring(
+                previousRoomIndex
+            )
+        )
+
+
+    else
+
+
+        Isaac.DebugString(
+            "RL_BACKTRACK TRANSITION "
+            .. tostring(
+                previousRoomIndex
+            )
+            .. " -> "
+            .. tostring(
+                newRoomIndex
+            )
+        )
+
+    end
+
+
+    encounterActive =
+        false
+
+
+    waitingForRoomExit =
+        false
+
+
+    navigationDoorSlot =
+        nil
+
+
+    -- Stop old movement while the new room state settles.
+    RL_MOVE =
+        "NONE"
+
+
+    RL_SHOOT =
+        "NONE"
+
+
+    -- =====================================================
+    -- COMPLETE FULL CURRICULUM
+    -- =====================================================
+
+    if roomsCompleted
+        >= TARGET_TRAINING_ROOMS then
+
+
+        trainingComplete =
+            true
+
+
+        trainingSpawnCountdown =
+            -1
+
+
+        trainingRoomIndex =
+            newRoomIndex
+
+
+        RemoveUncontrolledCombatEntities()
+
+
+        local room =
+            game:GetRoom()
+
+
+        if room ~= nil then
+
+            room:SetClear(
+                true
+            )
+
+        end
+
+
+        ReleaseTraversableTrainingRoomDoors()
+
+
+        Isaac.DebugString(
+            "RL_TRAINING COMPLETE episode="
+            .. tostring(
+                episodeId
+            )
+        )
+
+
+        return
+
+    end
+
+
+    -- =====================================================
+    -- NEXT ROOM
+    -- =====================================================
+
+    trainingRoomIndex =
+        newRoomIndex
+
+
+    -- If the agent comes back to a room it already
+    -- completed, do NOT spawn another training enemy.
+    if IsRoomCompleted(
+        newRoomIndex
+    ) then
+
+
+        PrepareNavigationOnlyRoom()
+
+
+        return
+
+    end
+
+
+    -- First visit to a new room:
+    -- prepare another controlled combat encounter.
+    encounterActive =
+        false
+
+
+    PrepareTrainingRoom()
+
+
+    trainingSpawnCountdown =
+        TRAINING_SPAWN_DELAY
+
+
+    Isaac.DebugString(
+        "RL_PREPARING NEW COMBAT ROOM "
+        .. tostring(
+            newRoomIndex
+        )
+    )
+
+end
+
+
+mod:AddCallback(
+    ModCallbacks.MC_POST_NEW_ROOM,
+    mod.OnNewRoom
+)
+
+
+-- =========================================================
 -- EPISODE START
 -- =========================================================
 
@@ -1635,8 +2528,45 @@ function mod:OnGameStarted(
         false
 
 
-    trainingRoomIndex =
+    encounterActive =
+        false
+
+
+    trainingComplete =
+        false
+
+
+    waitingForRoomExit =
+        false
+
+
+    roomsCompleted =
+        0
+
+
+    totalRoomTransitions =
+        0
+
+
+    visitedRoomIndices =
+        {}
+
+
+    completedRoomIndices =
+        {}
+
+
+    navigationDoorSlot =
         nil
+
+
+    trainingRoomIndex =
+        GetCurrentRoomIndex()
+
+
+    MarkRoomVisited(
+        trainingRoomIndex
+    )
 
 
     trainingSpawnCountdown =
@@ -1667,10 +2597,17 @@ function mod:OnGameStarted(
         nil
 
 
+    PrepareTrainingRoom()
+
+
     Isaac.DebugString(
         "RL_EPISODE START id="
         .. tostring(
             episodeId
+        )
+        .. " room="
+        .. tostring(
+            trainingRoomIndex
         )
     )
 
@@ -1712,6 +2649,10 @@ function mod:OnGameEnd(
 
 
     pendingActionFrame =
+        nil
+
+
+    navigationDoorSlot =
         nil
 
 
@@ -1767,8 +2708,13 @@ function mod:OnUpdate()
     end
 
 
+    if resetInProgress then
+        return
+    end
+
+
     -- =====================================================
-    -- SPAWN TRAINING ENEMY
+    -- WAITING TO SPAWN NEXT ENCOUNTER
     -- =====================================================
 
     if trainingSpawnCountdown
@@ -1778,6 +2724,13 @@ function mod:OnUpdate()
         trainingSpawnCountdown =
             trainingSpawnCountdown
             - 1
+
+
+        if not trainingComplete then
+
+            CloseTrainingRoomDoors()
+
+        end
 
 
         if trainingSpawnCountdown
@@ -1791,16 +2744,54 @@ function mod:OnUpdate()
     end
 
 
-    if resetInProgress
-    or not trainingReady then
+    -- =====================================================
+    -- TERMINAL STATE
+    -- =====================================================
+
+    if trainingComplete then
+
+
+        local frame =
+            game:GetFrameCount()
+
+
+        if frame
+            % STATE_SEND_INTERVAL
+            == 0 then
+
+
+            local state =
+                GetGameState()
+
+
+            if state ~= nil then
+
+                QueueState(
+                    state
+                )
+
+                FlushOutgoing()
+
+            end
+
+        end
+
 
         return
 
     end
 
 
+    -- While waiting for the next enemy spawn we suppress
+    -- observations so Python sees the room only after it is
+    -- ready.
+    if not encounterActive then
+        return
+    end
+
+
     -- =====================================================
-    -- TRAINING ROOM DOORS
+    -- COMBAT / NAVIGATION
     -- =====================================================
 
     local currentRoomIndex =
@@ -1818,13 +2809,26 @@ function mod:OnUpdate()
 
         if room:IsClear() then
 
-            -- Combat finished.
-            -- Navigation stage starts.
-            OpenTrainingRoomDoors()
+
+            waitingForRoomExit =
+                true
+
+
+            -- Only ordinary/free doors are released.
+            ReleaseTraversableTrainingRoomDoors()
+
 
         else
 
-            -- Combat still active.
+
+            waitingForRoomExit =
+                false
+
+
+            navigationDoorSlot =
+                nil
+
+
             CloseTrainingRoomDoors()
 
         end
@@ -1837,7 +2841,7 @@ function mod:OnUpdate()
 
 
     -- =====================================================
-    -- SEND STATE TO PYTHON
+    -- SEND STATE
     -- =====================================================
 
     if frame
@@ -1863,7 +2867,7 @@ function mod:OnUpdate()
 
 
     -- =====================================================
-    -- DEBUG LOG
+    -- DEBUG STATE
     -- =====================================================
 
     if frame

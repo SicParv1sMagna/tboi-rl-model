@@ -9,7 +9,11 @@ from stable_baselines3 import PPO
 from isaac_rl import IsaacEnv
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = (
+    Path(__file__)
+    .resolve()
+    .parents[1]
+)
 
 
 # =========================================================
@@ -29,17 +33,14 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=Path,
         required=True,
-        help=(
-            "Path to PPO model, for example "
-            "models/ppo_2026-10-05_04-00-00_final.zip"
-        ),
+        help="Path to PPO model.",
     )
 
     parser.add_argument(
         "--episodes",
         type=int,
         default=10,
-        help="Number of evaluation episodes.",
+        help="Number of episodes.",
     )
 
     parser.add_argument(
@@ -53,8 +54,8 @@ def parse_args() -> argparse.Namespace:
         "--stochastic",
         action="store_true",
         help=(
-            "Use stochastic policy actions instead of "
-            "deterministic evaluation."
+            "Use stochastic policy actions "
+            "instead of deterministic ones."
         ),
     )
 
@@ -75,15 +76,18 @@ def resolve_model_path(
             / model_path
         )
 
-    model_path = model_path.resolve()
+    model_path = (
+        model_path.resolve()
+    )
 
     if model_path.exists():
         return model_path
 
-    # Stable-Baselines3 commonly stores models as .zip.
     if model_path.suffix != ".zip":
-        zip_path = model_path.with_suffix(
-            ".zip"
+        zip_path = (
+            model_path.with_suffix(
+                ".zip"
+            )
         )
 
         if zip_path.exists():
@@ -106,7 +110,9 @@ def safe_mean(
         return 0.0
 
     return float(
-        np.mean(values)
+        np.mean(
+            values
+        )
     )
 
 
@@ -154,15 +160,10 @@ def main() -> None:
         "=" * 60
     )
 
-    # -----------------------------------------------------
-    # Load PPO
-    #
-    # We do not need to attach the environment to PPO
-    # for model.predict().
-    # -----------------------------------------------------
-
     model = PPO.load(
-        str(model_path)
+        str(
+            model_path
+        )
     )
 
     env = IsaacEnv(
@@ -172,7 +173,7 @@ def main() -> None:
     )
 
     # -----------------------------------------------------
-    # Aggregated statistics
+    # Aggregates
     # -----------------------------------------------------
 
     episode_rewards: list[float] = []
@@ -183,7 +184,9 @@ def main() -> None:
 
     remaining_hp_values: list[float] = []
 
-    successful_exit_lengths: list[float] = []
+    winning_lengths: list[float] = []
+
+    rooms_exited_values: list[float] = []
 
 
     wins = 0
@@ -249,7 +252,7 @@ def main() -> None:
 
 
             # =================================================
-            # FINAL EPISODE STATE
+            # FINAL STATE
             # =================================================
 
             hp_lost = float(
@@ -276,9 +279,23 @@ def main() -> None:
                 )
             )
 
-            exited_training_room = bool(
+            rooms_exited = int(
                 info.get(
-                    "exited_training_room",
+                    "rooms_exited",
+                    0,
+                )
+            )
+
+            target_room_exits = int(
+                info.get(
+                    "target_room_exits",
+                    3,
+                )
+            )
+
+            training_complete = bool(
+                info.get(
+                    "training_complete",
                     False,
                 )
             )
@@ -303,23 +320,15 @@ def main() -> None:
 
 
             # =================================================
-            # RESULT CLASSIFICATION
-            # =================================================
-            #
-            # IMPORTANT:
-            #
-            # Successful navigation is determined by an actual
-            # transition out of the training room.
-            #
-            # Killing the enemy alone is NOT enough.
+            # RESULT
             # =================================================
 
-            if exited_training_room:
+            if training_complete:
                 result = "WIN"
 
                 wins += 1
 
-                successful_exit_lengths.append(
+                winning_lengths.append(
                     float(
                         steps
                     )
@@ -369,6 +378,12 @@ def main() -> None:
                 remaining_hp
             )
 
+            rooms_exited_values.append(
+                float(
+                    rooms_exited
+                )
+            )
+
 
             no_hit_text = (
                 "YES"
@@ -380,6 +395,9 @@ def main() -> None:
             print(
                 f"episode={episode_index:03d} "
                 f"result={result:<7} "
+                f"rooms="
+                f"{rooms_exited}/"
+                f"{target_room_exits} "
                 f"reward={total_reward:+8.3f} "
                 f"steps={steps:4d} "
                 f"hp={remaining_hp:4.1f} "
@@ -393,7 +411,7 @@ def main() -> None:
 
 
     # =====================================================
-    # AGGREGATE RESULTS
+    # AGGREGATES
     # =====================================================
 
     episode_count = len(
@@ -455,6 +473,10 @@ def main() -> None:
         episode_lengths
     )
 
+    mean_winning_length = safe_mean(
+        winning_lengths
+    )
+
     mean_hp_lost = safe_mean(
         episode_hp_lost
     )
@@ -463,15 +485,13 @@ def main() -> None:
         remaining_hp_values
     )
 
-    mean_successful_exit_length = (
-        safe_mean(
-            successful_exit_lengths
-        )
+    mean_rooms_exited = safe_mean(
+        rooms_exited_values
     )
 
 
     # =====================================================
-    # PRINT RESULTS
+    # OUTPUT
     # =====================================================
 
     print()
@@ -494,7 +514,7 @@ def main() -> None:
     )
 
     print(
-        f"Wins (room exits):     "
+        f"Wins (3-room runs):    "
         f"{wins}"
     )
 
@@ -526,6 +546,11 @@ def main() -> None:
     print()
 
     print(
+        f"Mean rooms exited:     "
+        f"{mean_rooms_exited:.2f}/3"
+    )
+
+    print(
         f"Mean reward:           "
         f"{mean_reward:+.3f}"
     )
@@ -538,7 +563,7 @@ def main() -> None:
     if wins > 0:
         print(
             f"Mean winning length:   "
-            f"{mean_successful_exit_length:.1f}"
+            f"{mean_winning_length:.1f}"
         )
 
     print()

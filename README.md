@@ -1,65 +1,68 @@
-# TBOI RL Model
+# The Binding Of Isaac RL
 
-Проект по обучению RL-агента играть в The Binding Of Isaac: Afterbirth +
+## Reinforcement learning agent for The Binding of Isaac: Afterbirth+
 
-Цель - построить среду, в которой агент получает состояние игры, выбирает действие,
-а Lua-мод передает это действие в игру. Агент обучается через reinforcement learning
-с помощью PPO.
+A custom reinforcement learning environment that connects TBOI: Afterbirth+ with PPO via Lua mod and Gymnasium
 
-# Требования
+## About
 
-Проект тестируется с:
+This project explores wheter an RL agent can learn to play TBOI: Afterbirth+ using a custom game-to-Python bridge.
 
-- MacOS
-- TBOI: Afterbirth+
-- Python 3.10+;
-- Gymnasium
-- NumPy
+The game itself is controlled through a Lua mod. Game State is serialized to JSON and
+streamed over TCP to a Python environment implementing the Gymnasium API.
 
-Для Lua socket API TBOI должен запускаться с:
+The Python side uses Stable-Baselines3 PPO to train policies which send movement and shooting actions back to game.
+
+The project currently focuses on structured observations rather than raw pixels.
+
+The long-term goal is to progressively move from simple controlled encounters toward increasingly realistic Isaac gameplay.
+
+---
+
+## Current Status
+
+The project has already progressed through several curriculum stages:
+
+- Kill one enemy
+- Preserve health
+- Random enemy positions
+- Room navigation
+- Door approach + exit
+- Multi-room behaviour
+- Obstacle/hazard awareness
+
+The current generation is:
 
 ```
---luadebug
+structured_v2
 ```
 
-Флаг ослабляет ограничения Lua-среды Isaac. Использовать его рекомендуется только
-с доверенным кодом.
+It extends the original structured observation with local information about:
 
-# Training Env
+- Walls and obstacles
+- Blocked movement directions
+- Spikes
+- Fireplaces and other local hazards
 
-Пока задача намеренно очень простая. Агент должен научиться ориентироваться относительно врага,
-стрелять в правильном направлении, двигаться, избегать урона, уничтожать врага. Только после успешного
-решения этой задачи среда будет усложняться.
+The previous `structured_v1` generation successfully demonstrated:
 
-# Roadmap
+- Combat against a controlled enemy
+- Randomized enemy positioning
+- HP-aware behaviour
+- Switching between combat and navigation
+- Door selection
+- Actual room transitions
+- Repeated multi-room behaviour
 
-Следующие этапы проекта:
+The strongest single-room `structured_v1` evaluation reached:
 
-- [x] Read Isaac State From Lua
-- [x] Control Isaac From Lua
-- [x] Python-Lua TCP Bridge
-- [x] Gymnasium env
-- [x] Observation space
-- [x] Action space
-- [x] Basic reward
-- [x] Automatic episode reset
-- [x] Random smoke test
-- [ ] Stable-Baselines3
-- [ ] PPO training
-- [ ] TensorBoard metrics
-- [ ] Model checkpoints
-- [ ] Better reward shaping
-- [ ] Projectile observations
-- [ ] Multiple enemies
-- [ ] Multiple enemy types
-- [ ] Boss training
-- [ ] Item observations
-- [ ] Item selection
-- [ ] Room navigation
-- [ ] Full floor
-- [ ] Full run
+```
+Episodes:              10
+Wins:                   9
+Deaths:                 0
+Timeouts:               1
 
-# Long-term goal
-
-Конечная цель проекта - постепенный переход от простого боя с одним противником к полноценному прохождению
-TBOI.
+Win rate:              90.0%
+Mean winning length:   43.4
+Mean HP lost:           0.80
+```

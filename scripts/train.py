@@ -1,56 +1,51 @@
 from __future__ import annotations
 
 import argparse
-import json
+import os
 from datetime import datetime
 from pathlib import Path
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
-from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import (
+    CheckpointCallback,
+)
 
 from isaac_rl import IsaacEnv
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = (
+    Path(__file__)
+    .resolve()
+    .parents[1]
+)
 
-RUNS_DIR = PROJECT_ROOT / "runs"
-MODELS_DIR = PROJECT_ROOT / "models"
+DEFAULT_MODELS_DIR = (
+    PROJECT_ROOT
+    / "models"
+    / "structured_v2"
+)
+
+DEFAULT_RUNS_DIR = (
+    PROJECT_ROOT
+    / "runs"
+    / "structured_v2"
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a PPO agent "
-            "in The Binding of Isaac."
+            "Train PPO on the Isaac RL environment."
         )
     )
 
     parser.add_argument(
         "--timesteps",
         type=int,
-        default=10_000,
+        default=50_000,
         help=(
-            "Number of additional environment "
-            "steps to train."
+            "Number of additional training timesteps."
         ),
-    )
-
-    parser.add_argument(
-        "--max-episode-steps",
-        type=int,
-        default=600,
-        help=(
-            "Maximum number of steps "
-            "per episode."
-        ),
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed.",
     )
 
     parser.add_argument(
@@ -58,356 +53,272 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Optional path to an existing PPO "
-            ".zip model to continue training."
+            "Existing PPO .zip checkpoint to continue from."
         ),
     )
 
     parser.add_argument(
-        "--name",
-        type=str,
+        "--stage",
+        type=int,
+        choices=(1, 2, 3, 4),
         default=None,
         help=(
-            "Optional human-readable run name, "
-            "for example stage2_health."
+            "Curriculum stage. "
+            "Falls back to ISAAC_RL_STAGE or 1."
         ),
+    )
+
+    parser.add_argument(
+        "--checkpoint-freq",
+        type=int,
+        default=10_000,
+        help=(
+            "Save a checkpoint every N environment steps. "
+            "Use 0 to disable."
+        ),
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--models-dir",
+        type=Path,
+        default=DEFAULT_MODELS_DIR,
+    )
+
+    parser.add_argument(
+        "--runs-dir",
+        type=Path,
+        default=DEFAULT_RUNS_DIR,
     )
 
     return parser.parse_args()
 
 
+def resolve_stage(
+    cli_stage: int | None,
+) -> int:
+    if cli_stage is not None:
+        return cli_stage
+
+    return int(
+        os.environ.get(
+            "ISAAC_RL_STAGE",
+            "1",
+        )
+    )
+
+
 def resolve_model_path(
     path: Path,
 ) -> Path:
-    if path.is_absolute():
+    if not path.is_absolute():
+        path = (
+            PROJECT_ROOT
+            / path
+        )
+
+    path = path.resolve()
+
+    if path.exists():
         return path
 
-    return PROJECT_ROOT / path
-
-
-def create_run_name(
-    requested_name: str | None,
-    is_resume: bool,
-) -> str:
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d_%H-%M-%S"
-    )
-
-    if requested_name:
-        return (
-            f"{requested_name}_{timestamp}"
+    if path.suffix != ".zip":
+        candidate = (
+            path.with_suffix(
+                ".zip"
+            )
         )
 
-    if is_resume:
-        prefix = "ppo_resume"
-    else:
-        prefix = "ppo"
+        if candidate.exists():
+            return candidate
 
-    return (
-        f"{prefix}_{timestamp}"
+    raise FileNotFoundError(
+        f"Model not found: {path}"
     )
-
-
-def save_run_config(
-    *,
-    run_dir: Path,
-    args: argparse.Namespace,
-    run_name: str,
-    resume_path: Path | None,
-) -> None:
-    config = {
-        "run_name": run_name,
-        "timesteps": args.timesteps,
-        "max_episode_steps":
-            args.max_episode_steps,
-        "seed": args.seed,
-        "resume_model": (
-            str(resume_path)
-            if resume_path is not None
-            else None
-        ),
-    }
-
-    config_path = (
-        run_dir
-        / "config.json"
-    )
-
-    with config_path.open(
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            config,
-            file,
-            indent=4,
-        )
 
 
 def main() -> None:
     args = parse_args()
 
-    # =====================================================
-    # RESUME MODEL
-    # =====================================================
+    stage = resolve_stage(
+        args.stage
+    )
 
-    resume_path: Path | None = None
+    if stage not in (1, 2, 3, 4):
+        raise ValueError(
+            "Stage must be 1, 2, 3 or 4."
+        )
+
+    timestamp = datetime.now().strftime(
+        "%Y-%m-%d_%H-%M-%S"
+    )
+
+    stage_name = {
+        1: "combat_basics",
+        2: "combat_health_accuracy",
+        3: "single_room_navigation",
+        4: "three_room_run",
+    }[stage]
+
+    models_dir = (
+        args.models_dir
+        / f"stage_{stage}_{stage_name}"
+    )
+
+    runs_dir = (
+        args.runs_dir
+        / f"stage_{stage}_{stage_name}"
+    )
+
+    models_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    runs_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print("=" * 60)
+    print("ISAAC RL TRAINING")
+    print("=" * 60)
+
+    print(
+        f"Stage:       {stage}"
+    )
+
+    print(
+        f"Curriculum:  {stage_name}"
+    )
+
+    print(
+        f"Timesteps:   {args.timesteps}"
+    )
 
     if args.resume is not None:
-        resume_path = resolve_model_path(
-            args.resume
-        )
-
-        if not resume_path.exists():
-            raise FileNotFoundError(
-                f"Resume model not found: "
-                f"{resume_path}"
-            )
-
-    # =====================================================
-    # RUN DIRECTORIES
-    # =====================================================
-
-    run_name = create_run_name(
-        requested_name=args.name,
-        is_resume=resume_path is not None,
-    )
-
-    run_dir = (
-        RUNS_DIR
-        / run_name
-    )
-
-    checkpoint_dir = (
-        run_dir
-        / "checkpoints"
-    )
-
-    tensorboard_dir = (
-        run_dir
-        / "tensorboard"
-    )
-
-    run_dir.mkdir(
-        parents=True,
-        exist_ok=False,
-    )
-
-    checkpoint_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    tensorboard_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    MODELS_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    save_run_config(
-        run_dir=run_dir,
-        args=args,
-        run_name=run_name,
-        resume_path=resume_path,
-    )
-
-    # =====================================================
-    # OUTPUT
-    # =====================================================
-
-    print("=" * 60)
-    print("ISAAC RL - PPO TRAINING")
-    print("=" * 60)
-
-    print(
-        f"Run: {run_name}"
-    )
-
-    print(
-        f"Additional timesteps: "
-        f"{args.timesteps}"
-    )
-
-    print(
-        f"Max episode steps: "
-        f"{args.max_episode_steps}"
-    )
-
-    print(
-        f"Seed: {args.seed}"
-    )
-
-    if resume_path is None:
         print(
-            "Mode: fresh training"
+            f"Resume:      {args.resume}"
         )
-
     else:
         print(
-            "Mode: resume training"
+            "Resume:      fresh model"
         )
-
-        print(
-            f"Resume model: "
-            f"{resume_path}"
-        )
-
-    print()
 
     print(
-        "Start Isaac with --luadebug "
-        "and start a new run."
+        f"Models dir:  {models_dir}"
     )
 
-    print()
-
-    # =====================================================
-    # ENVIRONMENT
-    # =====================================================
-
-    base_env = IsaacEnv(
-        max_episode_steps=
-            args.max_episode_steps,
+    print(
+        f"Runs dir:    {runs_dir}"
     )
 
-    env = Monitor(
-        base_env,
-        filename=str(
-            run_dir
-            / "monitor.csv"
-        ),
+    print("=" * 60)
+
+    env = IsaacEnv(
+        curriculum_stage=stage
     )
 
-    # =====================================================
-    # CHECKPOINTS
-    # =====================================================
+    callback = None
 
-    checkpoint_callback = (
-        CheckpointCallback(
-            save_freq=5_000,
+    if args.checkpoint_freq > 0:
+        callback = CheckpointCallback(
+            save_freq=args.checkpoint_freq,
             save_path=str(
-                checkpoint_dir
+                models_dir
             ),
-            name_prefix="ppo_isaac",
-        )
-    )
-
-    # =====================================================
-    # MODEL
-    # =====================================================
-
-    if resume_path is None:
-        # ---------------------------------------------
-        # Fresh PPO model
-        # ---------------------------------------------
-
-        model = PPO(
-            policy="MlpPolicy",
-            env=env,
-
-            learning_rate=3e-4,
-
-            n_steps=256,
-            batch_size=64,
-            n_epochs=10,
-
-            gamma=0.99,
-            gae_lambda=0.95,
-
-            clip_range=0.2,
-
-            verbose=1,
-
-            seed=args.seed,
-
-            tensorboard_log=str(
-                tensorboard_dir
+            name_prefix=(
+                f"ppo_stage{stage}"
+                f"_{timestamp}"
+                "_checkpoint"
             ),
-
-            device="auto",
+            save_replay_buffer=False,
+            save_vecnormalize=False,
         )
-
-        reset_num_timesteps = True
-
-    else:
-        # ---------------------------------------------
-        # Continue training existing PPO model
-        # ---------------------------------------------
-
-        model = PPO.load(
-            resume_path,
-            env=env,
-
-            tensorboard_log=str(
-                tensorboard_dir
-            ),
-        )
-
-        reset_num_timesteps = False
-
-        print(
-            f"Loaded model with "
-            f"{model.num_timesteps} "
-            f"existing timesteps."
-        )
-
-        print()
-
-    # =====================================================
-    # TRAIN
-    # =====================================================
 
     try:
+        if args.resume is not None:
+            resume_path = (
+                resolve_model_path(
+                    args.resume
+                )
+            )
+
+            print(
+                "[train] Loading checkpoint:"
+            )
+
+            print(
+                f"[train] {resume_path}"
+            )
+
+            model = PPO.load(
+                str(resume_path),
+                env=env,
+                tensorboard_log=str(
+                    runs_dir
+                ),
+            )
+
+            reset_num_timesteps = False
+
+        else:
+            model = PPO(
+                "MlpPolicy",
+                env,
+                verbose=1,
+                tensorboard_log=str(
+                    runs_dir
+                ),
+                seed=args.seed,
+            )
+
+            reset_num_timesteps = True
+
         model.learn(
-            total_timesteps=
-                args.timesteps,
-
-            callback=
-                checkpoint_callback,
-
-            tb_log_name=
-                "ppo",
-
-            reset_num_timesteps=
-                reset_num_timesteps,
+            total_timesteps=(
+                args.timesteps
+            ),
+            callback=callback,
+            reset_num_timesteps=(
+                reset_num_timesteps
+            ),
         )
 
-        # =================================================
-        # SAVE FINAL MODEL
-        # =================================================
+        final_name = (
+            f"ppo_stage{stage}"
+            f"_{timestamp}"
+            "_final"
+        )
 
-        final_model_path = (
-            MODELS_DIR
-            / f"{run_name}_final"
+        final_path = (
+            models_dir
+            / final_name
         )
 
         model.save(
-            final_model_path
+            str(final_path)
         )
 
         print()
         print("=" * 60)
-        print("TRAINING FINISHED")
+        print("TRAINING COMPLETE")
         print("=" * 60)
 
         print(
-            f"Total model timesteps: "
-            f"{model.num_timesteps}"
+            "Saved:"
         )
 
         print(
-            f"Model saved to: "
-            f"{final_model_path}.zip"
+            f"{final_path}.zip"
         )
 
-        print(
-            f"Run data saved to: "
-            f"{run_dir}"
-        )
+        print("=" * 60)
 
     finally:
         env.close()

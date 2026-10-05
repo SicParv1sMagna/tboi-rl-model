@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -15,17 +16,19 @@ PROJECT_ROOT = (
     .parents[1]
 )
 
-
-# =========================================================
-# ARGUMENTS
-# =========================================================
+DIRECTIONS = (
+    "NONE",
+    "LEFT",
+    "RIGHT",
+    "UP",
+    "DOWN",
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a trained PPO agent "
-            "in The Binding of Isaac."
+            "Evaluate an Isaac PPO model."
         )
     )
 
@@ -33,204 +36,258 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=Path,
         required=True,
-        help="Path to PPO model.",
     )
 
     parser.add_argument(
         "--episodes",
         type=int,
         default=10,
-        help="Number of episodes.",
+    )
+
+    parser.add_argument(
+        "--stage",
+        type=int,
+        choices=(1, 2, 3, 4),
+        default=None,
+        help=(
+            "Curriculum stage. "
+            "Falls back to ISAAC_RL_STAGE or 1."
+        ),
     )
 
     parser.add_argument(
         "--max-episode-steps",
         type=int,
-        default=600,
-        help="Maximum steps per episode.",
+        default=None,
     )
 
     parser.add_argument(
         "--stochastic",
         action="store_true",
-        help=(
-            "Use stochastic policy actions "
-            "instead of deterministic ones."
-        ),
     )
 
     return parser.parse_args()
 
 
-# =========================================================
-# MODEL PATH
-# =========================================================
+def resolve_stage(
+    cli_stage: int | None,
+) -> int:
+    if cli_stage is not None:
+        return cli_stage
+
+    return int(
+        os.environ.get(
+            "ISAAC_RL_STAGE",
+            "1",
+        )
+    )
 
 
 def resolve_model_path(
-    model_path: Path,
+    path: Path,
 ) -> Path:
-    if not model_path.is_absolute():
-        model_path = (
+    if not path.is_absolute():
+        path = (
             PROJECT_ROOT
-            / model_path
+            / path
         )
 
-    model_path = (
-        model_path.resolve()
-    )
+    path = path.resolve()
 
-    if model_path.exists():
-        return model_path
+    if path.exists():
+        return path
 
-    if model_path.suffix != ".zip":
-        zip_path = (
-            model_path.with_suffix(
+    if path.suffix != ".zip":
+        candidate = (
+            path.with_suffix(
                 ".zip"
             )
         )
 
-        if zip_path.exists():
-            return zip_path
+        if candidate.exists():
+            return candidate
 
     raise FileNotFoundError(
-        f"Model not found: {model_path}"
+        f"Model not found: {path}"
     )
 
 
-# =========================================================
-# SAFE MEAN
-# =========================================================
-
-
-def safe_mean(
+def mean(
     values: list[float],
 ) -> float:
     if not values:
         return 0.0
 
     return float(
-        np.mean(
-            values
-        )
+        np.mean(values)
     )
 
 
-# =========================================================
-# MAIN
-# =========================================================
+def print_distribution(
+    title: str,
+    counts: dict[str, int],
+) -> None:
+    total = sum(
+        counts.values()
+    )
+
+    print(title)
+
+    for direction in DIRECTIONS:
+        count = counts[
+            direction
+        ]
+
+        percentage = (
+            count / total * 100.0
+            if total > 0
+            else 0.0
+        )
+
+        print(
+            f"{direction:<6} "
+            f"{count:6d} "
+            f"{percentage:6.1f}%"
+        )
 
 
 def main() -> None:
     args = parse_args()
 
-    model_path = resolve_model_path(
-        args.model
+    stage = resolve_stage(
+        args.stage
+    )
+
+    model_path = (
+        resolve_model_path(
+            args.model
+        )
+    )
+
+    env = IsaacEnv(
+        curriculum_stage=stage,
+        max_episode_steps=(
+            args.max_episode_steps
+        ),
+    )
+
+    model = PPO.load(
+        str(model_path)
     )
 
     deterministic = (
         not args.stochastic
     )
 
-    print(
-        "=" * 60
-    )
+    print("=" * 60)
+    print("ISAAC RL EVALUATION")
+    print("=" * 60)
 
     print(
-        "ISAAC RL EVALUATION"
-    )
-
-    print(
-        "=" * 60
+        f"Stage:          "
+        f"{env.curriculum_stage}"
     )
 
     print(
-        f"Model:         {model_path}"
+        f"Curriculum:     "
+        f"{env.stage_config['name']}"
     )
 
     print(
-        f"Episodes:      {args.episodes}"
+        f"Model:          "
+        f"{model_path}"
     )
 
     print(
-        f"Deterministic: {deterministic}"
+        f"Episodes:       "
+        f"{args.episodes}"
     )
 
     print(
-        "=" * 60
+        f"Max steps:      "
+        f"{env.max_episode_steps}"
     )
 
-    model = PPO.load(
-        str(
-            model_path
-        )
+    print(
+        f"Deterministic:  "
+        f"{deterministic}"
     )
 
-    env = IsaacEnv(
-        max_episode_steps=(
-            args.max_episode_steps
-        )
-    )
+    print("=" * 60)
 
-    # -----------------------------------------------------
-    # Aggregates
-    # -----------------------------------------------------
+    rewards: list[float] = []
+    lengths: list[float] = []
 
-    episode_rewards: list[float] = []
-
-    episode_lengths: list[float] = []
-
-    episode_hp_lost: list[float] = []
-
+    hp_lost_values: list[float] = []
     remaining_hp_values: list[float] = []
 
+    rooms_values: list[float] = []
     winning_lengths: list[float] = []
 
-    rooms_exited_values: list[float] = []
+    nav_steps_values: list[float] = []
+    nav_missing_values: list[float] = []
+    zero_candidate_values: list[float] = []
 
+    blocked_values: list[float] = []
+    stuck_values: list[float] = []
+
+    tears_fired_values: list[float] = []
+    tears_hit_values: list[float] = []
+    tears_missed_values: list[float] = []
+
+    combat_move_counts = {
+        direction: 0
+        for direction in DIRECTIONS
+    }
+
+    combat_shoot_counts = {
+        direction: 0
+        for direction in DIRECTIONS
+    }
 
     wins = 0
-
     deaths = 0
-
     timeouts = 0
-
-    unknowns = 0
-
+    unknown = 0
 
     no_hit_episodes = 0
-
     no_hit_wins = 0
 
+    final_target_room_exits = 0
 
     try:
         for episode_index in range(
             1,
             args.episodes + 1,
         ):
-            observation, reset_info = (
+            observation, info = (
                 env.reset()
             )
 
             total_reward = 0.0
-
             steps = 0
 
+            nav_steps = 0
+            nav_missing = 0
+
+            zero_candidates = 0
+
+            blocked_moves = 0
+            stuck_moves = 0
+
             terminated = False
-
             truncated = False
-
-            info = reset_info
-
 
             while (
                 not terminated
                 and not truncated
             ):
-                action, _state = (
+                action, _ = (
                     model.predict(
                         observation,
-                        deterministic=deterministic,
+                        deterministic=(
+                            deterministic
+                        ),
                     )
                 )
 
@@ -250,10 +307,132 @@ def main() -> None:
 
                 steps += 1
 
+                navigation_mode = bool(
+                    info.get(
+                        "navigation_mode",
+                        False,
+                    )
+                )
 
-            # =================================================
-            # FINAL STATE
-            # =================================================
+                if navigation_mode:
+                    nav_steps += 1
+                else:
+                    applied_move = str(
+                        info.get(
+                            "applied_move",
+                            "NONE",
+                        )
+                    )
+
+                    applied_shoot = str(
+                        info.get(
+                            "applied_shoot",
+                            "NONE",
+                        )
+                    )
+
+                    if (
+                        applied_move
+                        in combat_move_counts
+                    ):
+                        combat_move_counts[
+                            applied_move
+                        ] += 1
+
+                    if (
+                        applied_shoot
+                        in combat_shoot_counts
+                    ):
+                        combat_shoot_counts[
+                            applied_shoot
+                        ] += 1
+
+                if bool(
+                    info.get(
+                        "navigation_target_missing",
+                        False,
+                    )
+                ):
+                    nav_missing += 1
+
+                if (
+                    env.curriculum_stage >= 3
+                    and bool(
+                        info.get(
+                            "room_clear",
+                            False,
+                        )
+                    )
+                    and not bool(
+                        info.get(
+                            "training_complete",
+                            False,
+                        )
+                    )
+                    and int(
+                        info.get(
+                            "navigation_candidate_count",
+                            0,
+                        )
+                    )
+                    == 0
+                ):
+                    zero_candidates += 1
+
+                if bool(
+                    info.get(
+                        "blocked_move_attempted",
+                        False,
+                    )
+                ):
+                    blocked_moves += 1
+
+                if bool(
+                    info.get(
+                        "stuck_move_attempted",
+                        False,
+                    )
+                ):
+                    stuck_moves += 1
+
+            complete = bool(
+                info.get(
+                    "training_complete",
+                    False,
+                )
+            )
+
+            dead = bool(
+                info.get(
+                    "dead",
+                    False,
+                )
+            )
+
+            timeout = bool(
+                info.get(
+                    "timeout",
+                    False,
+                )
+            )
+
+            rooms = int(
+                info.get(
+                    "rooms_exited",
+                    0,
+                )
+            )
+
+            target_rooms = int(
+                info.get(
+                    "target_room_exits",
+                    0,
+                )
+            )
+
+            final_target_room_exits = (
+                target_rooms
+            )
 
             hp_lost = float(
                 info.get(
@@ -279,98 +458,82 @@ def main() -> None:
                 )
             )
 
-            rooms_exited = int(
+            tears_fired = int(
                 info.get(
-                    "rooms_exited",
+                    "tears_fired",
                     0,
                 )
             )
 
-            target_room_exits = int(
+            tears_hit = int(
                 info.get(
-                    "target_room_exits",
-                    3,
+                    "tears_hit",
+                    0,
                 )
             )
 
-            training_complete = bool(
+            tears_missed = int(
                 info.get(
-                    "training_complete",
-                    False,
+                    "tears_missed",
+                    0,
                 )
             )
 
-            dead = bool(
-                info.get(
-                    "dead",
-                    False,
-                )
+            confirmed_tears = (
+                tears_hit
+                + tears_missed
             )
 
-            timeout = bool(
-                info.get(
-                    "timeout",
-                    False,
-                )
-                or (
-                    truncated
-                    and not terminated
-                )
+            unresolved_tears = max(
+                0,
+                tears_fired
+                - confirmed_tears,
             )
 
+            if confirmed_tears > 0:
+                tear_accuracy = (
+                    tears_hit
+                    / confirmed_tears
+                    * 100.0
+                )
+            else:
+                tear_accuracy = 0.0
 
-            # =================================================
-            # RESULT
-            # =================================================
-
-            if training_complete:
+            if complete:
                 result = "WIN"
-
                 wins += 1
 
                 winning_lengths.append(
-                    float(
-                        steps
-                    )
+                    float(steps)
                 )
 
                 if no_hit:
                     no_hit_wins += 1
 
-
             elif dead:
                 result = "DEATH"
-
                 deaths += 1
-
 
             elif timeout:
                 result = "TIMEOUT"
-
                 timeouts += 1
-
 
             else:
                 result = "UNKNOWN"
-
-                unknowns += 1
-
+                unknown += 1
 
             if no_hit:
                 no_hit_episodes += 1
 
-
-            episode_rewards.append(
+            rewards.append(
                 total_reward
             )
 
-            episode_lengths.append(
-                float(
-                    steps
-                )
+            lengths.append(
+                float(steps)
             )
 
-            episode_hp_lost.append(
+            hp_lost_values.append(
                 hp_lost
             )
 
@@ -378,143 +541,167 @@ def main() -> None:
                 remaining_hp
             )
 
-            rooms_exited_values.append(
+            rooms_values.append(
+                float(rooms)
+            )
+
+            nav_steps_values.append(
+                float(nav_steps)
+            )
+
+            nav_missing_values.append(
+                float(nav_missing)
+            )
+
+            zero_candidate_values.append(
                 float(
-                    rooms_exited
+                    zero_candidates
                 )
             )
 
-
-            no_hit_text = (
-                "YES"
-                if no_hit
-                else "NO"
+            blocked_values.append(
+                float(blocked_moves)
             )
 
+            stuck_values.append(
+                float(stuck_moves)
+            )
+
+            tears_fired_values.append(
+                float(tears_fired)
+            )
+
+            tears_hit_values.append(
+                float(tears_hit)
+            )
+
+            tears_missed_values.append(
+                float(tears_missed)
+            )
 
             print(
                 f"episode={episode_index:03d} "
                 f"result={result:<7} "
-                f"rooms="
-                f"{rooms_exited}/"
-                f"{target_room_exits} "
                 f"reward={total_reward:+8.3f} "
                 f"steps={steps:4d} "
                 f"hp={remaining_hp:4.1f} "
                 f"hp_lost={hp_lost:4.1f} "
-                f"no_hit={no_hit_text}"
+                f"tears="
+                f"{tears_hit}H/"
+                f"{tears_missed}M "
+                f"acc={tear_accuracy:5.1f}% "
+                f"in_flight={unresolved_tears}",
+                end="",
             )
 
+            if target_rooms > 0:
+                print(
+                    f" rooms="
+                    f"{rooms}/"
+                    f"{target_rooms}"
+                )
+            else:
+                print()
 
     finally:
         env.close()
 
+    count = len(rewards)
 
-    # =====================================================
-    # AGGREGATES
-    # =====================================================
-
-    episode_count = len(
-        episode_rewards
+    win_rate = (
+        wins
+        / count
+        * 100.0
+        if count
+        else 0.0
     )
 
+    timeout_rate = (
+        timeouts
+        / count
+        * 100.0
+        if count
+        else 0.0
+    )
 
-    if episode_count > 0:
-        win_rate = (
-            wins
-            / episode_count
+    no_hit_rate = (
+        no_hit_episodes
+        / count
+        * 100.0
+        if count
+        else 0.0
+    )
+
+    no_hit_among_wins = (
+        no_hit_wins
+        / wins
+        * 100.0
+        if wins
+        else 0.0
+    )
+
+    total_tears_fired = int(
+        sum(
+            tears_fired_values
+        )
+    )
+
+    total_tears_hit = int(
+        sum(
+            tears_hit_values
+        )
+    )
+
+    total_tears_missed = int(
+        sum(
+            tears_missed_values
+        )
+    )
+
+    total_confirmed_tears = (
+        total_tears_hit
+        + total_tears_missed
+    )
+
+    total_unresolved_tears = max(
+        0,
+        total_tears_fired
+        - total_confirmed_tears,
+    )
+
+    if total_confirmed_tears > 0:
+        overall_tear_accuracy = (
+            total_tears_hit
+            / total_confirmed_tears
             * 100.0
         )
-
-        timeout_rate = (
-            timeouts
-            / episode_count
-            * 100.0
-        )
-
-        no_hit_episode_rate = (
-            no_hit_episodes
-            / episode_count
-            * 100.0
-        )
-
-        no_hit_win_rate = (
-            no_hit_wins
-            / episode_count
-            * 100.0
-        )
-
     else:
-        win_rate = 0.0
+        overall_tear_accuracy = 0.0
 
-        timeout_rate = 0.0
+    print()
+    print("=" * 60)
+    print("EVALUATION RESULTS")
+    print("=" * 60)
 
-        no_hit_episode_rate = 0.0
-
-        no_hit_win_rate = 0.0
-
-
-    if wins > 0:
-        no_hit_among_wins = (
-            no_hit_wins
-            / wins
-            * 100.0
-        )
-
-    else:
-        no_hit_among_wins = 0.0
-
-
-    mean_reward = safe_mean(
-        episode_rewards
+    print(
+        f"Curriculum stage:      "
+        f"{env.curriculum_stage}"
     )
 
-    mean_episode_length = safe_mean(
-        episode_lengths
+    print(
+        f"Curriculum:            "
+        f"{env.stage_config['name']}"
     )
-
-    mean_winning_length = safe_mean(
-        winning_lengths
-    )
-
-    mean_hp_lost = safe_mean(
-        episode_hp_lost
-    )
-
-    mean_remaining_hp = safe_mean(
-        remaining_hp_values
-    )
-
-    mean_rooms_exited = safe_mean(
-        rooms_exited_values
-    )
-
-
-    # =====================================================
-    # OUTPUT
-    # =====================================================
 
     print()
 
     print(
-        "=" * 60
-    )
-
-    print(
-        "EVALUATION RESULTS"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    print(
         f"Episodes:              "
-        f"{episode_count}"
+        f"{count}"
     )
 
     print(
-        f"Wins (3-room runs):    "
+        f"Wins:                  "
         f"{wins}"
     )
 
@@ -530,7 +717,7 @@ def main() -> None:
 
     print(
         f"Unknown:               "
-        f"{unknowns}"
+        f"{unknown}"
     )
 
     print(
@@ -545,37 +732,39 @@ def main() -> None:
 
     print()
 
-    print(
-        f"Mean rooms exited:     "
-        f"{mean_rooms_exited:.2f}/3"
-    )
+    if final_target_room_exits > 0:
+        print(
+            f"Mean rooms exited:     "
+            f"{mean(rooms_values):.2f}/"
+            f"{final_target_room_exits}"
+        )
 
     print(
         f"Mean reward:           "
-        f"{mean_reward:+.3f}"
+        f"{mean(rewards):+.3f}"
     )
 
     print(
         f"Mean episode length:   "
-        f"{mean_episode_length:.1f}"
+        f"{mean(lengths):.1f}"
     )
 
-    if wins > 0:
+    if winning_lengths:
         print(
             f"Mean winning length:   "
-            f"{mean_winning_length:.1f}"
+            f"{mean(winning_lengths):.1f}"
         )
 
     print()
 
     print(
         f"Mean HP lost:          "
-        f"{mean_hp_lost:.2f}"
+        f"{mean(hp_lost_values):.2f}"
     )
 
     print(
         f"Mean remaining HP:     "
-        f"{mean_remaining_hp:.2f}"
+        f"{mean(remaining_hp_values):.2f}"
     )
 
     print()
@@ -587,7 +776,7 @@ def main() -> None:
 
     print(
         f"No-hit episode rate:   "
-        f"{no_hit_episode_rate:.1f}%"
+        f"{no_hit_rate:.1f}%"
     )
 
     print(
@@ -596,18 +785,91 @@ def main() -> None:
     )
 
     print(
-        f"No-hit win rate:       "
-        f"{no_hit_win_rate:.1f}%"
-    )
-
-    print(
         f"No-hit among wins:     "
         f"{no_hit_among_wins:.1f}%"
     )
 
+    print()
+    print("-" * 60)
+    print("COMBAT ACCURACY")
+    print("-" * 60)
+
     print(
-        "=" * 60
+        f"Mean tears fired:      "
+        f"{mean(tears_fired_values):.1f}"
     )
+
+    print(
+        f"Mean tears hit:        "
+        f"{mean(tears_hit_values):.1f}"
+    )
+
+    print(
+        f"Mean tears missed:     "
+        f"{mean(tears_missed_values):.1f}"
+    )
+
+    print(
+        f"Overall tear accuracy: "
+        f"{overall_tear_accuracy:.1f}%"
+    )
+
+    print(
+        f"Unresolved at end:     "
+        f"{total_unresolved_tears}"
+    )
+
+    print()
+    print("-" * 60)
+    print("COMBAT SHOOT ACTION DISTRIBUTION")
+    print("-" * 60)
+
+    print_distribution(
+        "",
+        combat_shoot_counts,
+    )
+
+    print()
+    print("-" * 60)
+    print("COMBAT MOVE ACTION DISTRIBUTION")
+    print("-" * 60)
+
+    print_distribution(
+        "",
+        combat_move_counts,
+    )
+
+    print()
+    print("-" * 60)
+    print("NAVIGATION / COLLISION DIAGNOSTICS")
+    print("-" * 60)
+
+    print(
+        f"Mean navigation steps: "
+        f"{mean(nav_steps_values):.1f}"
+    )
+
+    print(
+        f"Mean missing targets:  "
+        f"{mean(nav_missing_values):.1f}"
+    )
+
+    print(
+        f"Mean zero-candidate:   "
+        f"{mean(zero_candidate_values):.1f}"
+    )
+
+    print(
+        f"Mean blocked moves:    "
+        f"{mean(blocked_values):.1f}"
+    )
+
+    print(
+        f"Mean stuck moves:      "
+        f"{mean(stuck_values):.1f}"
+    )
+
+    print("=" * 60)
 
 
 if __name__ == "__main__":

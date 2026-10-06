@@ -32,50 +32,41 @@ DEFAULT_RUNS_DIR = (
 )
 
 
+STAGE_NAMES = {
+    1: "combat_basics",
+    2: "combat_health_accuracy",
+    3: "combat_multi_enemy",
+    4: "single_room_navigation",
+    5: "three_room_run",
+}
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Train PPO on the Isaac RL environment."
-        )
-    )
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--timesteps",
         type=int,
         default=50_000,
-        help=(
-            "Number of additional training timesteps."
-        ),
     )
 
     parser.add_argument(
         "--resume",
         type=Path,
         default=None,
-        help=(
-            "Existing PPO .zip checkpoint to continue from."
-        ),
     )
 
     parser.add_argument(
         "--stage",
         type=int,
-        choices=(1, 2, 3, 4),
+        choices=(1, 2, 3, 4, 5),
         default=None,
-        help=(
-            "Curriculum stage. "
-            "Falls back to ISAAC_RL_STAGE or 1."
-        ),
     )
 
     parser.add_argument(
         "--checkpoint-freq",
         type=int,
         default=10_000,
-        help=(
-            "Save a checkpoint every N environment steps. "
-            "Use 0 to disable."
-        ),
     )
 
     parser.add_argument(
@@ -100,10 +91,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_stage(
-    cli_stage: int | None,
+    stage: int | None,
 ) -> int:
-    if cli_stage is not None:
-        return cli_stage
+    if stage is not None:
+        return stage
 
     return int(
         os.environ.get(
@@ -149,21 +140,21 @@ def main() -> None:
         args.stage
     )
 
-    if stage not in (1, 2, 3, 4):
+    if stage not in STAGE_NAMES:
         raise ValueError(
-            "Stage must be 1, 2, 3 or 4."
+            "Stage must be 1..5"
         )
 
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d_%H-%M-%S"
+    stage_name = (
+        STAGE_NAMES[stage]
     )
 
-    stage_name = {
-        1: "combat_basics",
-        2: "combat_health_accuracy",
-        3: "single_room_navigation",
-        4: "three_room_run",
-    }[stage]
+    timestamp = (
+        datetime.now()
+        .strftime(
+            "%Y-%m-%d_%H-%M-%S"
+        )
+    )
 
     models_dir = (
         args.models_dir
@@ -188,36 +179,10 @@ def main() -> None:
     print("=" * 60)
     print("ISAAC RL TRAINING")
     print("=" * 60)
-
-    print(
-        f"Stage:       {stage}"
-    )
-
-    print(
-        f"Curriculum:  {stage_name}"
-    )
-
-    print(
-        f"Timesteps:   {args.timesteps}"
-    )
-
-    if args.resume is not None:
-        print(
-            f"Resume:      {args.resume}"
-        )
-    else:
-        print(
-            "Resume:      fresh model"
-        )
-
-    print(
-        f"Models dir:  {models_dir}"
-    )
-
-    print(
-        f"Runs dir:    {runs_dir}"
-    )
-
+    print(f"Stage:      {stage}")
+    print(f"Curriculum: {stage_name}")
+    print(f"Timesteps:  {args.timesteps}")
+    print(f"Models:     {models_dir}")
     print("=" * 60)
 
     env = IsaacEnv(
@@ -228,7 +193,9 @@ def main() -> None:
 
     if args.checkpoint_freq > 0:
         callback = CheckpointCallback(
-            save_freq=args.checkpoint_freq,
+            save_freq=(
+                args.checkpoint_freq
+            ),
             save_path=str(
                 models_dir
             ),
@@ -237,8 +204,6 @@ def main() -> None:
                 f"_{timestamp}"
                 "_checkpoint"
             ),
-            save_replay_buffer=False,
-            save_vecnormalize=False,
         )
 
     try:
@@ -250,11 +215,8 @@ def main() -> None:
             )
 
             print(
-                "[train] Loading checkpoint:"
-            )
-
-            print(
-                f"[train] {resume_path}"
+                f"[train] Resume: "
+                f"{resume_path}"
             )
 
             model = PPO.load(
@@ -290,15 +252,13 @@ def main() -> None:
             ),
         )
 
-        final_name = (
-            f"ppo_stage{stage}"
-            f"_{timestamp}"
-            "_final"
-        )
-
         final_path = (
             models_dir
-            / final_name
+            / (
+                f"ppo_stage{stage}"
+                f"_{timestamp}"
+                "_final"
+            )
         )
 
         model.save(
@@ -306,19 +266,10 @@ def main() -> None:
         )
 
         print()
-        print("=" * 60)
-        print("TRAINING COMPLETE")
-        print("=" * 60)
-
         print(
-            "Saved:"
-        )
-
-        print(
+            f"Saved: "
             f"{final_path}.zip"
         )
-
-        print("=" * 60)
 
     finally:
         env.close()

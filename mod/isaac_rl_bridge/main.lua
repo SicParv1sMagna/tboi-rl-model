@@ -24,22 +24,28 @@ local TRAINING_SPAWN_DELAY = 8
 -- =========================================================
 --
 -- Stage 1:
+--   1 enemy
 --   combat basics
---   4 cardinal enemy spawn positions
---   kill = success
 --
 -- Stage 2:
---   combat + health + accuracy
---   8 enemy spawn positions
---   kill = success
+--   1 enemy
+--   8 spawn directions
+--   preserve health
+--   tear accuracy
 --
 -- Stage 3:
---   combat -> navigation -> exit one room
+--   2 enemies
+--   generic multi-enemy combat
 --
 -- Stage 4:
---   three combat/navigation rooms
+--   random 1..3 enemies
+--   clear + exit one room
 --
--- Python sends the selected stage on every reset.
+-- Stage 5:
+--   random 1..3 enemies
+--   three-room run
+--
+-- Observation stays fixed at 21 values.
 -- =========================================================
 
 local curriculumStage = 1
@@ -56,8 +62,8 @@ local function NormalizeCurriculumStage(value)
 
     if stage < 1 then
         stage = 1
-    elseif stage > 4 then
-        stage = 4
+    elseif stage > 5 then
+        stage = 5
     end
 
     return stage
@@ -70,6 +76,8 @@ local function GetCurriculumName()
     elseif curriculumStage == 2 then
         return "combat_health_accuracy"
     elseif curriculumStage == 3 then
+        return "combat_multi_enemy"
+    elseif curriculumStage == 4 then
         return "single_room_navigation"
     end
 
@@ -78,18 +86,38 @@ end
 
 
 local function StageUsesNavigation()
+    return curriculumStage >= 4
+end
+
+
+local function StageUsesEnemyDanger()
+    -- Keep Stage 1/2 sensor semantics compatible with
+    -- the already trained checkpoint.
     return curriculumStage >= 3
 end
 
 
 local function GetTargetRoomExits()
-    if curriculumStage <= 2 then
+    if curriculumStage <= 3 then
         return 0
-    elseif curriculumStage == 3 then
+    elseif curriculumStage == 4 then
         return 1
     end
 
     return 3
+end
+
+
+local function GetDesiredEnemyCount()
+    if curriculumStage <= 2 then
+        return 1
+    elseif curriculumStage == 3 then
+        return 2
+    end
+
+    -- Stages 4/5:
+    -- random 1..3 enemies per new combat room.
+    return (Random() % 3) + 1
 end
 
 
@@ -102,7 +130,6 @@ local TRAINING_ENEMY_VARIANT = 0
 local TRAINING_ENEMY_SUBTYPE = 0
 
 
--- Stage 1 stays comparable to the model we already trained.
 local TRAINING_ENEMY_OFFSETS_STAGE_1 = {
     Vector(160, 0),
     Vector(-160, 0),
@@ -111,10 +138,7 @@ local TRAINING_ENEMY_OFFSETS_STAGE_1 = {
 }
 
 
--- Stage 2+ introduces diagonal positions.
--- This forces more varied aiming without rewarding
--- any particular shoot direction.
-local TRAINING_ENEMY_OFFSETS_STAGE_2_PLUS = {
+local TRAINING_ENEMY_OFFSETS_GENERAL = {
     Vector(160, 0),
     Vector(-160, 0),
     Vector(0, 120),
@@ -127,12 +151,15 @@ local TRAINING_ENEMY_OFFSETS_STAGE_2_PLUS = {
 }
 
 
+local MIN_ENEMY_SPAWN_DISTANCE = 110
+
+
 local function GetTrainingEnemyOffsets()
     if curriculumStage == 1 then
         return TRAINING_ENEMY_OFFSETS_STAGE_1
     end
 
-    return TRAINING_ENEMY_OFFSETS_STAGE_2_PLUS
+    return TRAINING_ENEMY_OFFSETS_GENERAL
 end
 
 
@@ -157,6 +184,11 @@ local SENSOR_DANGER_DISTANCE_1 = 35
 local SENSOR_DANGER_DISTANCE_2 = 65
 
 local FIRE_DANGER_RADIUS = 42
+
+-- Radius around each directional sample point where
+-- an enemy contributes to danger.
+local ENEMY_DANGER_RADIUS = 60
+
 
 local SENSOR_DIRECTIONS = {
     left = Vector(-1, 0),
@@ -200,6 +232,9 @@ local totalRoomTransitions = 0
 
 local waitingForRoomExit = false
 
+-- Desired number for current combat encounter.
+local currentEncounterEnemyTargetCount = 0
+
 
 -- =========================================================
 -- MAP MEMORY
@@ -213,19 +248,6 @@ local navigationDoorSlot = nil
 
 -- =========================================================
 -- TEAR ACCURACY
--- =========================================================
---
--- fired:
---   unique player tear registered
---
--- hit:
---   unique tear touched at least one vulnerable enemy
---
--- missed:
---   tracked tear disappeared without ever touching
---   a vulnerable enemy
---
--- Piercing tears count as one successful tear.
 -- =========================================================
 
 local tearsFired = 0
@@ -267,6 +289,7 @@ local MOVE_ACTIONS = {
     DOWN = ButtonAction.ACTION_DOWN
 }
 
+
 local SHOOT_ACTIONS = {
     LEFT = ButtonAction.ACTION_SHOOTLEFT,
     RIGHT = ButtonAction.ACTION_SHOOTRIGHT,
@@ -277,13 +300,13 @@ local SHOOT_ACTIONS = {
 
 Isaac.DebugString("======================================")
 Isaac.DebugString("ISAAC RL BRIDGE")
-Isaac.DebugString("STRUCTURED V2 / CURRICULUM")
+Isaac.DebugString("STRUCTURED V2 / GENERIC ENEMIES")
 Isaac.DebugString("OBSERVATION SIZE: 21")
 Isaac.DebugString("======================================")
 
 
 -- =========================================================
--- GENERAL HELPERS
+-- GENERIC HELPERS
 -- =========================================================
 
 local function IsValidDirection(value)
@@ -342,6 +365,25 @@ local function DistanceSquared(a, b)
 end
 
 
+local function ShuffleIndices(count)
+    local indices = {}
+
+    for i = 1, count do
+        indices[i] = i
+    end
+
+    for i = count, 2, -1 do
+        local j = (Random() % i) + 1
+
+        local tmp = indices[i]
+        indices[i] = indices[j]
+        indices[j] = tmp
+    end
+
+    return indices
+end
+
+
 -- =========================================================
 -- TEAR TRACKING
 -- =========================================================
@@ -351,31 +393,25 @@ local function IsMainPlayerTear(tear)
         return false
     end
 
-    -- Most reliable simple signal for direct Isaac tears.
-    if tear.SpawnerType == EntityType.ENTITY_PLAYER then
-        return true
-    end
-
-    -- Fallback in case SpawnerType was incomplete during INIT.
-    local spawner = tear.SpawnerEntity
-
-    if spawner == nil then
-        return false
-    end
-
-    local player = spawner:ToPlayer()
-
-    if player == nil then
-        return false
-    end
-
     local mainPlayer = Isaac.GetPlayer(0)
 
     if mainPlayer == nil then
         return false
     end
 
-    return player.InitSeed == mainPlayer.InitSeed
+    local spawner = tear.SpawnerEntity
+
+    if spawner ~= nil then
+        local player = spawner:ToPlayer()
+
+        if player ~= nil then
+            return player.InitSeed == mainPlayer.InitSeed
+        end
+    end
+
+    -- Fallback for INIT frames where the spawner reference
+    -- is incomplete.
+    return tear.SpawnerType == EntityType.ENTITY_PLAYER
 end
 
 
@@ -407,8 +443,6 @@ local function TryTrackPlayerTear(tear)
         return
     end
 
-    -- MC_POST_TEAR_INIT + MC_POST_TEAR_UPDATE both call this.
-    -- Never register the same tear twice.
     if trackedTears[seed] ~= nil then
         return
     end
@@ -435,8 +469,7 @@ mod:AddCallback(
 
 
 function mod:OnTearUpdate(tear)
-    -- Retry tracking here because INIT callbacks in AB+
-    -- may expose incomplete entity data.
+    -- Retry once tear data is fully populated.
     TryTrackPlayerTear(tear)
 end
 
@@ -452,14 +485,10 @@ function mod:OnTearCollision(tear, collider, low)
         return nil
     end
 
-    local seed = tear.InitSeed
-    local tracked = trackedTears[seed]
+    local tracked =
+        trackedTears[tear.InitSeed]
 
-    if tracked == nil then
-        return nil
-    end
-
-    if tracked.hit then
+    if tracked == nil or tracked.hit then
         return nil
     end
 
@@ -485,21 +514,19 @@ function mod:OnTearRemoved(entity)
         return
     end
 
-    local seed = entity.InitSeed
-    local tracked = trackedTears[seed]
+    local tracked =
+        trackedTears[entity.InitSeed]
 
     if tracked == nil then
         return
     end
 
-    -- Prevent any double classification.
-    trackedTears[seed] = nil
+    trackedTears[entity.InitSeed] = nil
 
     if tracked.hit then
         return
     end
 
-    -- Cleanup at episode/reset should not be a miss.
     if resetInProgress
         or trainingComplete
         or not encounterActive then
@@ -511,19 +538,15 @@ function mod:OnTearRemoved(entity)
         return
     end
 
-    -- Entity unloading during room transition is not a miss.
+    -- Entity removal during room unloading must not
+    -- count as a miss.
     if tracked.room_index ~= GetCurrentRoomIndex() then
         return
     end
 
     local room = game:GetRoom()
 
-    if room == nil then
-        return
-    end
-
-    -- Once combat is already won, trailing tears do not matter.
-    if room:IsClear() then
+    if room == nil or room:IsClear() then
         return
     end
 
@@ -543,19 +566,24 @@ mod:AddCallback(
 -- =========================================================
 
 local function IsGridHazardAtPosition(room, position)
-    local gridEntity = room:GetGridEntityFromPos(position)
+    local gridEntity =
+        room:GetGridEntityFromPos(position)
 
     if gridEntity == nil then
         return false
     end
 
-    local gridType = gridEntity:GetType()
+    local gridType =
+        gridEntity:GetType()
 
     if gridType == GridEntityType.GRID_SPIKES then
         return true
     end
 
-    if gridType == GridEntityType.GRID_SPIKES_ONOFF then
+    if GridEntityType.GRID_SPIKES_ONOFF ~= nil
+        and gridType
+        == GridEntityType.GRID_SPIKES_ONOFF then
+
         return true
     end
 
@@ -585,10 +613,37 @@ local function IsFireHazardNearPosition(position)
 end
 
 
-local function IsPositionDangerous(room, position)
+local function IsStaticDangerAtPosition(room, position)
     return
         IsGridHazardAtPosition(room, position)
         or IsFireHazardNearPosition(position)
+end
+
+
+local function IsEnemyDangerNearPosition(position)
+    if not StageUsesEnemyDanger() then
+        return false
+    end
+
+    local radiusSquared =
+        ENEMY_DANGER_RADIUS
+        * ENEMY_DANGER_RADIUS
+
+    for _, entity in ipairs(Isaac.GetRoomEntities()) do
+        if entity:IsActiveEnemy(false)
+            and entity:IsVulnerableEnemy() then
+
+            if DistanceSquared(
+                entity.Position,
+                position
+            ) <= radiusSquared then
+
+                return true
+            end
+        end
+    end
+
+    return false
 end
 
 
@@ -596,36 +651,62 @@ end
 -- LOCAL SENSORS
 -- =========================================================
 
-local function IsDirectionBlocked(room, player, direction)
+local function IsDirectionBlocked(
+    room,
+    player,
+    direction
+)
     local target =
         player.Position
         + direction * SENSOR_BLOCK_DISTANCE
 
-    local clear = room:CheckLine(
-        player.Position,
-        target,
-        0,
-        0,
-        false,
-        false
-    )
+    local clear =
+        room:CheckLine(
+            player.Position,
+            target,
+            0,
+            0,
+            false,
+            false
+        )
 
     return not clear
 end
 
 
-local function IsDirectionDangerous(room, player, direction)
+local function GetDirectionDanger(
+    room,
+    player,
+    direction
+)
     local sample1 =
         player.Position
-        + direction * SENSOR_DANGER_DISTANCE_1
+        + direction
+        * SENSOR_DANGER_DISTANCE_1
 
     local sample2 =
         player.Position
-        + direction * SENSOR_DANGER_DISTANCE_2
+        + direction
+        * SENSOR_DANGER_DISTANCE_2
+
+    local staticDanger =
+        IsStaticDangerAtPosition(
+            room,
+            sample1
+        )
+        or IsStaticDangerAtPosition(
+            room,
+            sample2
+        )
+
+    local enemyDanger =
+        IsEnemyDangerNearPosition(sample1)
+        or IsEnemyDangerNearPosition(sample2)
 
     return
-        IsPositionDangerous(room, sample1)
-        or IsPositionDangerous(room, sample2)
+        staticDanger or enemyDanger,
+        staticDanger,
+        enemyDanger
 end
 
 
@@ -646,10 +727,26 @@ local function GetLocalSensors(player)
         down = false
     }
 
+    local staticDanger = {
+        left = false,
+        right = false,
+        up = false,
+        down = false
+    }
+
+    local enemyDanger = {
+        left = false,
+        right = false,
+        up = false,
+        down = false
+    }
+
     if room == nil or player == nil then
         return {
             blocked = blocked,
-            danger = danger
+            danger = danger,
+            static_danger = staticDanger,
+            enemy_danger = enemyDanger
         }
     end
 
@@ -661,23 +758,29 @@ local function GetLocalSensors(player)
                 direction
             )
 
-        danger[name] =
-            IsDirectionDangerous(
+        local combined, staticValue, enemyValue =
+            GetDirectionDanger(
                 room,
                 player,
                 direction
             )
+
+        danger[name] = combined
+        staticDanger[name] = staticValue
+        enemyDanger[name] = enemyValue
     end
 
     return {
         blocked = blocked,
-        danger = danger
+        danger = danger,
+        static_danger = staticDanger,
+        enemy_danger = enemyDanger
     }
 end
 
 
 -- =========================================================
--- SAFE ENEMY SPAWN
+-- GENERIC ENEMY SPAWN
 -- =========================================================
 
 local function IsSafeTrainingSpawnPosition(
@@ -702,15 +805,39 @@ local function IsSafeTrainingSpawnPosition(
         return false
     end
 
-    if IsPositionDangerous(room, position) then
+    if IsStaticDangerAtPosition(
+        room,
+        position
+    ) then
         return false
     end
 
-    if player ~= nil then
-        if DistanceSquared(
+    if player ~= nil
+        and DistanceSquared(
             player.Position,
             position
         ) < 120 * 120 then
+
+        return false
+    end
+
+    return true
+end
+
+
+local function IsFarEnoughFromChosen(
+    position,
+    chosenPositions
+)
+    local minimumSquared =
+        MIN_ENEMY_SPAWN_DISTANCE
+        * MIN_ENEMY_SPAWN_DISTANCE
+
+    for _, existing in ipairs(chosenPositions) do
+        if DistanceSquared(
+            position,
+            existing
+        ) < minimumSquared then
 
             return false
         end
@@ -720,30 +847,25 @@ local function IsSafeTrainingSpawnPosition(
 end
 
 
-local function FindSafeTrainingSpawnPosition(
+local function FindTrainingSpawnPositions(
     room,
-    player
+    player,
+    requestedCount
 )
-    local offsets = GetTrainingEnemyOffsets()
-    local center = room:GetCenterPos()
+    local offsets =
+        GetTrainingEnemyOffsets()
 
-    local startIndex =
-        (Random() % #offsets) + 1
+    local order =
+        ShuffleIndices(#offsets)
 
-    for offsetStep = 0, #offsets - 1 do
-        local offsetIndex =
-            (
-                (
-                    startIndex
-                    - 1
-                    + offsetStep
-                )
-                % #offsets
-            )
-            + 1
+    local center =
+        room:GetCenterPos()
 
+    local chosen = {}
+
+    for _, index in ipairs(order) do
         local desiredPosition =
-            center + offsets[offsetIndex]
+            center + offsets[index]
 
         local freePosition =
             room:FindFreePickupSpawnPosition(
@@ -756,28 +878,24 @@ local function FindSafeTrainingSpawnPosition(
             room,
             player,
             freePosition
-        ) then
+        )
+            and IsFarEnoughFromChosen(
+                freePosition,
+                chosen
+            ) then
 
-            return freePosition, offsetIndex
+            table.insert(
+                chosen,
+                freePosition
+            )
+
+            if #chosen >= requestedCount then
+                return chosen
+            end
         end
     end
 
-    local fallback =
-        room:FindFreeTilePosition(
-            center,
-            40
-        )
-
-    if IsSafeTrainingSpawnPosition(
-        room,
-        player,
-        fallback
-    ) then
-
-        return fallback, 0
-    end
-
-    return nil, nil
+    return nil
 end
 
 
@@ -866,7 +984,8 @@ local function CountNavigationCandidates(room)
     local count = 0
 
     for slot = 0, DoorSlot.NUM_DOOR_SLOTS - 1 do
-        local door = room:GetDoor(slot)
+        local door =
+            room:GetDoor(slot)
 
         if CanTraverseTrainingDoor(door) then
             count = count + 1
@@ -920,19 +1039,16 @@ local function ConnectToPython()
 
     lastConnectAttempt = frame
 
-    local client = socket.tcp()
+    local client =
+        socket.tcp()
 
     if client == nil then
-        Isaac.DebugString(
-            "RL_SOCKET CREATE FAILED"
-        )
-
         return
     end
 
     client:settimeout(0.05)
 
-    local success, err =
+    local success =
         client:connect(
             HOST,
             PORT
@@ -967,7 +1083,8 @@ local function CloseTrainingRoomDoors()
     end
 
     for slot = 0, DoorSlot.NUM_DOOR_SLOTS - 1 do
-        local door = room:GetDoor(slot)
+        local door =
+            room:GetDoor(slot)
 
         if door ~= nil then
             door:Close(true)
@@ -984,7 +1101,8 @@ local function ReleaseTraversableTrainingRoomDoors()
     end
 
     for slot = 0, DoorSlot.NUM_DOOR_SLOTS - 1 do
-        local door = room:GetDoor(slot)
+        local door =
+            room:GetDoor(slot)
 
         if CanTraverseTrainingDoor(door) then
             door:Open()
@@ -1025,6 +1143,8 @@ local function PrepareTrainingRoom()
     navigationDoorSlot = nil
     waitingForRoomExit = false
 
+    currentEncounterEnemyTargetCount = 0
+
     CloseTrainingRoomDoors()
 end
 
@@ -1044,14 +1164,12 @@ local function PrepareNavigationOnlyRoom()
     waitingForRoomExit = true
 
     trainingSpawnCountdown = -1
+
+    currentEncounterEnemyTargetCount = 0
+
     navigationDoorSlot = nil
 
     ReleaseTraversableTrainingRoomDoors()
-
-    Isaac.DebugString(
-        "RL_NAVIGATION ONLY room="
-        .. tostring(GetCurrentRoomIndex())
-    )
 end
 
 
@@ -1064,7 +1182,8 @@ local function GetDoorNavigationData(
     player,
     slot
 )
-    local door = room:GetDoor(slot)
+    local door =
+        room:GetDoor(slot)
 
     if not CanTraverseTrainingDoor(door) then
         return nil
@@ -1112,8 +1231,7 @@ local function GetDoorNavigationData(
 
     local approachDistance =
         math.sqrt(
-            dx * dx
-            + dy * dy
+            dx * dx + dy * dy
         )
 
     local aligned = false
@@ -1158,7 +1276,8 @@ local function GetDoorNavigationData(
     end
 
     local phase = "APPROACH"
-    local targetPosition = approachPosition
+    local targetPosition =
+        approachPosition
 
     if aligned and reachedApproachPlane then
         phase = "EXIT"
@@ -1201,10 +1320,7 @@ local function GetDoorNavigationData(
 end
 
 
-local function SelectNavigationDoor(
-    room,
-    player
-)
+local function SelectNavigationDoor(room, player)
     local bestUnvisited = nil
     local bestVisited = nil
     local currentCandidate = nil
@@ -1354,10 +1470,10 @@ end
 
 
 -- =========================================================
--- SPAWN TRAINING ENEMY
+-- GENERIC COMBAT ENCOUNTER
 -- =========================================================
 
-local function SpawnTrainingEnemy()
+local function SpawnTrainingEncounter()
     local room = game:GetRoom()
 
     if room == nil or trainingComplete then
@@ -1372,36 +1488,55 @@ local function SpawnTrainingEnemy()
     local player =
         Isaac.GetPlayer(0)
 
-    local spawnPosition, offsetIndex =
-        FindSafeTrainingSpawnPosition(
+    if currentEncounterEnemyTargetCount <= 0 then
+        currentEncounterEnemyTargetCount =
+            GetDesiredEnemyCount()
+    end
+
+    local positions =
+        FindTrainingSpawnPositions(
             room,
-            player
+            player,
+            currentEncounterEnemyTargetCount
         )
 
-    if spawnPosition == nil then
+    if positions == nil then
         Isaac.DebugString(
-            "RL_TRAINING NO SAFE SPAWN"
+            "RL_TRAINING NO SAFE MULTI SPAWN"
+            .. " requested="
+            .. tostring(
+                currentEncounterEnemyTargetCount
+            )
         )
 
         return false
     end
 
-    local enemy =
-        Isaac.Spawn(
-            TRAINING_ENEMY_TYPE,
-            TRAINING_ENEMY_VARIANT,
-            TRAINING_ENEMY_SUBTYPE,
-            spawnPosition,
-            Vector(0, 0),
-            nil
-        )
+    local spawned = {}
 
-    if enemy == nil then
-        Isaac.DebugString(
-            "RL_TRAINING ENEMY SPAWN FAILED"
-        )
+    for _, position in ipairs(positions) do
+        local enemy =
+            Isaac.Spawn(
+                TRAINING_ENEMY_TYPE,
+                TRAINING_ENEMY_VARIANT,
+                TRAINING_ENEMY_SUBTYPE,
+                position,
+                Vector(0, 0),
+                nil
+            )
 
-        return false
+        if enemy == nil then
+            for _, existing in ipairs(spawned) do
+                existing:Remove()
+            end
+
+            return false
+        end
+
+        table.insert(
+            spawned,
+            enemy
+        )
     end
 
     trainingRoomIndex =
@@ -1415,6 +1550,7 @@ local function SpawnTrainingEnemy()
     waitingForRoomExit = false
 
     navigationDoorSlot = nil
+
     trainingReady = true
 
     Isaac.DebugString(
@@ -1423,8 +1559,8 @@ local function SpawnTrainingEnemy()
         .. tostring(curriculumStage)
         .. " room="
         .. tostring(trainingRoomIndex)
-        .. " spawn="
-        .. tostring(offsetIndex)
+        .. " enemies="
+        .. tostring(#spawned)
     )
 
     return true
@@ -1453,6 +1589,8 @@ local function RequestReset()
     totalRoomTransitions = 0
 
     waitingForRoomExit = false
+
+    currentEncounterEnemyTargetCount = 0
 
     visitedRoomIndices = {}
     completedRoomIndices = {}
@@ -1592,10 +1730,6 @@ local function ReadPythonCommands()
 
             if #rxBuffer > 65536 then
                 rxBuffer = ""
-
-                Isaac.DebugString(
-                    "RL RX BUFFER OVERFLOW"
-                )
             end
 
             if err == "timeout" then
@@ -1662,7 +1796,8 @@ local function GetGameState()
         return nil
     end
 
-    local room = game:GetRoom()
+    local room =
+        game:GetRoom()
 
     if room == nil then
         return nil
@@ -1687,6 +1822,9 @@ local function GetGameState()
             table.insert(
                 enemies,
                 {
+                    seed =
+                        entity.InitSeed,
+
                     type =
                         entity.Type,
 
@@ -1729,7 +1867,8 @@ local function GetGameState()
         and not trainingComplete
         and room:IsClear()
         and trainingRoomIndex ~= nil
-        and currentRoomIndex == trainingRoomIndex then
+        and currentRoomIndex
+        == trainingRoomIndex then
 
         navigationCandidateCount =
             CountNavigationCandidates(
@@ -1756,8 +1895,7 @@ local function GetGameState()
         room:GetCenterPos()
 
     return {
-        type =
-            "state",
+        type = "state",
 
         curriculum_stage =
             curriculumStage,
@@ -1779,6 +1917,12 @@ local function GetGameState()
 
         training_complete =
             trainingComplete,
+
+        encounter_enemy_target_count =
+            currentEncounterEnemyTargetCount,
+
+        enemy_danger_enabled =
+            StageUsesEnemyDanger(),
 
         rooms_exited =
             roomsCompleted,
@@ -1872,7 +2016,9 @@ local function GetGameState()
             navigationTarget,
 
         local_sensors =
-            GetLocalSensors(player),
+            GetLocalSensors(
+                player
+            ),
 
         control = {
             enabled =
@@ -1892,7 +2038,9 @@ end
 
 
 local function QueueState(state)
-    if tcp == nil or txBuffer ~= "" then
+    if tcp == nil
+        or txBuffer ~= "" then
+
         return
     end
 
@@ -1903,10 +2051,6 @@ local function QueueState(state)
         )
 
     if not success then
-        Isaac.DebugString(
-            "RL JSON ENCODE ERROR"
-        )
-
         return
     end
 
@@ -1916,7 +2060,7 @@ end
 
 
 -- =========================================================
--- NEW ROOM
+-- ROOM TRANSITIONS
 -- =========================================================
 
 function mod:OnNewRoom()
@@ -1939,7 +2083,8 @@ function mod:OnNewRoom()
         trainingRoomIndex
 
     if previousRoomIndex == nil
-        or newRoomIndex == previousRoomIndex then
+        or newRoomIndex
+        == previousRoomIndex then
 
         return
     end
@@ -1960,15 +2105,6 @@ function mod:OnNewRoom()
 
         roomsCompleted =
             roomsCompleted + 1
-
-        Isaac.DebugString(
-            "RL_ROOM COMPLETE "
-            .. tostring(roomsCompleted)
-            .. "/"
-            .. tostring(
-                GetTargetRoomExits()
-            )
-        )
     else
         Isaac.DebugString(
             "RL_BACKTRACK "
@@ -1980,6 +2116,8 @@ function mod:OnNewRoom()
 
     encounterActive = false
     waitingForRoomExit = false
+
+    currentEncounterEnemyTargetCount = 0
 
     navigationDoorSlot = nil
 
@@ -1997,19 +2135,14 @@ function mod:OnNewRoom()
 
         RemoveUncontrolledCombatEntities()
 
-        local room = game:GetRoom()
+        local room =
+            game:GetRoom()
 
         if room ~= nil then
             room:SetClear(true)
         end
 
         ReleaseTraversableTrainingRoomDoors()
-
-        Isaac.DebugString(
-            "RL_TRAINING COMPLETE"
-            .. " stage="
-            .. tostring(curriculumStage)
-        )
 
         return
     end
@@ -2058,6 +2191,8 @@ function mod:OnGameStarted(isContinued)
     totalRoomTransitions = 0
 
     waitingForRoomExit = false
+
+    currentEncounterEnemyTargetCount = 0
 
     visitedRoomIndices = {}
     completedRoomIndices = {}
@@ -2136,10 +2271,10 @@ function mod:OnUpdate()
     local currentFrame =
         game:GetFrameCount()
 
-    -- ACK only after at least one real game update.
     if pendingActionId ~= nil
         and pendingActionFrame ~= nil
-        and currentFrame > pendingActionFrame then
+        and currentFrame
+        > pendingActionFrame then
 
         RL_ACTION_ID =
             pendingActionId
@@ -2152,10 +2287,7 @@ function mod:OnUpdate()
         return
     end
 
-    -- -----------------------------------------------------
-    -- SPAWN
-    -- -----------------------------------------------------
-
+    -- Spawn encounter.
     if trainingSpawnCountdown > 0 then
         trainingSpawnCountdown =
             trainingSpawnCountdown - 1
@@ -2164,7 +2296,7 @@ function mod:OnUpdate()
 
         if trainingSpawnCountdown == 0 then
             local spawned =
-                SpawnTrainingEnemy()
+                SpawnTrainingEncounter()
 
             if not spawned then
                 trainingSpawnCountdown =
@@ -2173,10 +2305,7 @@ function mod:OnUpdate()
         end
     end
 
-    -- -----------------------------------------------------
-    -- TERMINAL STATE
-    -- -----------------------------------------------------
-
+    -- Terminal state still needs to be transmitted.
     if trainingComplete then
         if currentFrame
             % STATE_SEND_INTERVAL
@@ -2198,10 +2327,6 @@ function mod:OnUpdate()
         return
     end
 
-    -- -----------------------------------------------------
-    -- COMBAT / NAVIGATION
-    -- -----------------------------------------------------
-
     local currentRoomIndex =
         GetCurrentRoomIndex()
 
@@ -2218,8 +2343,8 @@ function mod:OnUpdate()
 
                 ReleaseTraversableTrainingRoomDoors()
             else
-                -- Stage 1 / Stage 2:
-                -- killing the enemy completes the episode.
+                -- Stage 1/2/3:
+                -- clearing the encounter = success.
                 trainingComplete = true
 
                 encounterActive = false
@@ -2238,10 +2363,6 @@ function mod:OnUpdate()
         end
     end
 
-    -- -----------------------------------------------------
-    -- STATE SEND
-    -- -----------------------------------------------------
-
     if currentFrame
         % STATE_SEND_INTERVAL
         == 0 then
@@ -2254,10 +2375,6 @@ function mod:OnUpdate()
             FlushOutgoing()
         end
     end
-
-    -- -----------------------------------------------------
-    -- DEBUG
-    -- -----------------------------------------------------
 
     if currentFrame
         % STATE_LOG_INTERVAL
@@ -2317,7 +2434,9 @@ function mod:OnInput(
     inputHook,
     buttonAction
 )
-    if not RL_ENABLED or entity == nil then
+    if not RL_ENABLED
+        or entity == nil then
+
         return nil
     end
 

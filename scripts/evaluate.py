@@ -26,11 +26,7 @@ DIRECTIONS = (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate an Isaac PPO model."
-        )
-    )
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--model",
@@ -47,12 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage",
         type=int,
-        choices=(1, 2, 3, 4),
+        choices=(1, 2, 3, 4, 5),
         default=None,
-        help=(
-            "Curriculum stage. "
-            "Falls back to ISAAC_RL_STAGE or 1."
-        ),
     )
 
     parser.add_argument(
@@ -70,10 +62,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_stage(
-    cli_stage: int | None,
+    stage: int | None,
 ) -> int:
-    if cli_stage is not None:
-        return cli_stage
+    if stage is not None:
+        return stage
 
     return int(
         os.environ.get(
@@ -124,22 +116,21 @@ def mean(
 
 
 def print_distribution(
-    title: str,
     counts: dict[str, int],
 ) -> None:
     total = sum(
         counts.values()
     )
 
-    print(title)
-
     for direction in DIRECTIONS:
         count = counts[
             direction
         ]
 
-        percentage = (
-            count / total * 100.0
+        percent = (
+            count
+            / total
+            * 100.0
             if total > 0
             else 0.0
         )
@@ -147,7 +138,7 @@ def print_distribution(
         print(
             f"{direction:<6} "
             f"{count:6d} "
-            f"{percentage:6.1f}%"
+            f"{percent:6.1f}%"
         )
 
 
@@ -179,42 +170,6 @@ def main() -> None:
         not args.stochastic
     )
 
-    print("=" * 60)
-    print("ISAAC RL EVALUATION")
-    print("=" * 60)
-
-    print(
-        f"Stage:          "
-        f"{env.curriculum_stage}"
-    )
-
-    print(
-        f"Curriculum:     "
-        f"{env.stage_config['name']}"
-    )
-
-    print(
-        f"Model:          "
-        f"{model_path}"
-    )
-
-    print(
-        f"Episodes:       "
-        f"{args.episodes}"
-    )
-
-    print(
-        f"Max steps:      "
-        f"{env.max_episode_steps}"
-    )
-
-    print(
-        f"Deterministic:  "
-        f"{deterministic}"
-    )
-
-    print("=" * 60)
-
     rewards: list[float] = []
     lengths: list[float] = []
 
@@ -222,11 +177,12 @@ def main() -> None:
     remaining_hp_values: list[float] = []
 
     rooms_values: list[float] = []
-    winning_lengths: list[float] = []
+
+    encounter_enemy_values: list[float] = []
+    target_switch_values: list[float] = []
 
     nav_steps_values: list[float] = []
     nav_missing_values: list[float] = []
-    zero_candidate_values: list[float] = []
 
     blocked_values: list[float] = []
     stuck_values: list[float] = []
@@ -253,10 +209,22 @@ def main() -> None:
     no_hit_episodes = 0
     no_hit_wins = 0
 
-    final_target_room_exits = 0
+    target_room_exits = 0
+
+    print("=" * 60)
+    print("ISAAC RL EVALUATION")
+    print("=" * 60)
+    print(f"Stage:          {stage}")
+    print(
+        f"Curriculum:     "
+        f"{env.stage_config['name']}"
+    )
+    print(f"Episodes:       {args.episodes}")
+    print(f"Deterministic:  {deterministic}")
+    print("=" * 60)
 
     try:
-        for episode_index in range(
+        for episode_number in range(
             1,
             args.episodes + 1,
         ):
@@ -264,16 +232,38 @@ def main() -> None:
                 env.reset()
             )
 
+            initial_enemy_target = int(
+                info.get(
+                    "encounter_enemy_target_count",
+                    info.get(
+                        "enemy_count",
+                        0,
+                    ),
+                )
+            )
+
+            encounter_enemy_values.append(
+                float(
+                    initial_enemy_target
+                )
+            )
+
             total_reward = 0.0
             steps = 0
 
-            nav_steps = 0
-            nav_missing = 0
-
-            zero_candidates = 0
+            navigation_steps = 0
+            navigation_missing = 0
 
             blocked_moves = 0
             stuck_moves = 0
+
+            target_switches = 0
+
+            previous_target_seed = (
+                info.get(
+                    "combat_target_seed"
+                )
+            )
 
             terminated = False
             truncated = False
@@ -315,36 +305,30 @@ def main() -> None:
                 )
 
                 if navigation_mode:
-                    nav_steps += 1
+                    navigation_steps += 1
                 else:
-                    applied_move = str(
+                    move = str(
                         info.get(
                             "applied_move",
                             "NONE",
                         )
                     )
 
-                    applied_shoot = str(
+                    shoot = str(
                         info.get(
                             "applied_shoot",
                             "NONE",
                         )
                     )
 
-                    if (
-                        applied_move
-                        in combat_move_counts
-                    ):
+                    if move in combat_move_counts:
                         combat_move_counts[
-                            applied_move
+                            move
                         ] += 1
 
-                    if (
-                        applied_shoot
-                        in combat_shoot_counts
-                    ):
+                    if shoot in combat_shoot_counts:
                         combat_shoot_counts[
-                            applied_shoot
+                            shoot
                         ] += 1
 
                 if bool(
@@ -353,31 +337,7 @@ def main() -> None:
                         False,
                     )
                 ):
-                    nav_missing += 1
-
-                if (
-                    env.curriculum_stage >= 3
-                    and bool(
-                        info.get(
-                            "room_clear",
-                            False,
-                        )
-                    )
-                    and not bool(
-                        info.get(
-                            "training_complete",
-                            False,
-                        )
-                    )
-                    and int(
-                        info.get(
-                            "navigation_candidate_count",
-                            0,
-                        )
-                    )
-                    == 0
-                ):
-                    zero_candidates += 1
+                    navigation_missing += 1
 
                 if bool(
                     info.get(
@@ -394,6 +354,25 @@ def main() -> None:
                     )
                 ):
                     stuck_moves += 1
+
+                current_target_seed = (
+                    info.get(
+                        "combat_target_seed"
+                    )
+                )
+
+                if (
+                    previous_target_seed is not None
+                    and current_target_seed is not None
+                    and current_target_seed
+                    != previous_target_seed
+                ):
+                    target_switches += 1
+
+                if current_target_seed is not None:
+                    previous_target_seed = (
+                        current_target_seed
+                    )
 
             complete = bool(
                 info.get(
@@ -423,15 +402,11 @@ def main() -> None:
                 )
             )
 
-            target_rooms = int(
+            target_room_exits = int(
                 info.get(
                     "target_room_exits",
                     0,
                 )
-            )
-
-            final_target_room_exits = (
-                target_rooms
             )
 
             hp_lost = float(
@@ -479,33 +454,28 @@ def main() -> None:
                 )
             )
 
-            confirmed_tears = (
+            confirmed = (
                 tears_hit
                 + tears_missed
             )
 
-            unresolved_tears = max(
+            unresolved = max(
                 0,
                 tears_fired
-                - confirmed_tears,
+                - confirmed,
             )
 
-            if confirmed_tears > 0:
-                tear_accuracy = (
-                    tears_hit
-                    / confirmed_tears
-                    * 100.0
-                )
-            else:
-                tear_accuracy = 0.0
+            accuracy = (
+                tears_hit
+                / confirmed
+                * 100.0
+                if confirmed > 0
+                else 0.0
+            )
 
             if complete:
                 result = "WIN"
                 wins += 1
-
-                winning_lengths.append(
-                    float(steps)
-                )
 
                 if no_hit:
                     no_hit_wins += 1
@@ -545,81 +515,85 @@ def main() -> None:
                 float(rooms)
             )
 
+            target_switch_values.append(
+                float(
+                    target_switches
+                )
+            )
+
             nav_steps_values.append(
-                float(nav_steps)
+                float(
+                    navigation_steps
+                )
             )
 
             nav_missing_values.append(
-                float(nav_missing)
-            )
-
-            zero_candidate_values.append(
                 float(
-                    zero_candidates
+                    navigation_missing
                 )
             )
 
             blocked_values.append(
-                float(blocked_moves)
+                float(
+                    blocked_moves
+                )
             )
 
             stuck_values.append(
-                float(stuck_moves)
+                float(
+                    stuck_moves
+                )
             )
 
             tears_fired_values.append(
-                float(tears_fired)
+                float(
+                    tears_fired
+                )
             )
 
             tears_hit_values.append(
-                float(tears_hit)
+                float(
+                    tears_hit
+                )
             )
 
             tears_missed_values.append(
-                float(tears_missed)
+                float(
+                    tears_missed
+                )
             )
 
             print(
-                f"episode={episode_index:03d} "
+                f"episode={episode_number:03d} "
                 f"result={result:<7} "
+                f"enemies={initial_enemy_target} "
                 f"reward={total_reward:+8.3f} "
                 f"steps={steps:4d} "
                 f"hp={remaining_hp:4.1f} "
-                f"hp_lost={hp_lost:4.1f} "
+                f"lost={hp_lost:4.1f} "
                 f"tears="
                 f"{tears_hit}H/"
                 f"{tears_missed}M "
-                f"acc={tear_accuracy:5.1f}% "
-                f"in_flight={unresolved_tears}",
-                end="",
+                f"acc={accuracy:5.1f}% "
+                f"switches={target_switches} "
+                f"in_flight={unresolved}"
             )
-
-            if target_rooms > 0:
-                print(
-                    f" rooms="
-                    f"{rooms}/"
-                    f"{target_rooms}"
-                )
-            else:
-                print()
 
     finally:
         env.close()
 
-    count = len(rewards)
+    count = len(
+        rewards
+    )
 
     win_rate = (
-        wins
-        / count
-        * 100.0
+        wins / count * 100.0
         if count
         else 0.0
     )
 
     timeout_rate = (
-        timeouts
-        / count
-        * 100.0
+        timeouts / count * 100.0
         if count
         else 0.0
     )
@@ -640,43 +614,30 @@ def main() -> None:
         else 0.0
     )
 
-    total_tears_fired = int(
-        sum(
-            tears_fired_values
-        )
-    )
-
-    total_tears_hit = int(
+    total_hit = int(
         sum(
             tears_hit_values
         )
     )
 
-    total_tears_missed = int(
+    total_missed = int(
         sum(
             tears_missed_values
         )
     )
 
-    total_confirmed_tears = (
-        total_tears_hit
-        + total_tears_missed
+    total_confirmed = (
+        total_hit
+        + total_missed
     )
 
-    total_unresolved_tears = max(
-        0,
-        total_tears_fired
-        - total_confirmed_tears,
+    overall_accuracy = (
+        total_hit
+        / total_confirmed
+        * 100.0
+        if total_confirmed > 0
+        else 0.0
     )
-
-    if total_confirmed_tears > 0:
-        overall_tear_accuracy = (
-            total_tears_hit
-            / total_confirmed_tears
-            * 100.0
-        )
-    else:
-        overall_tear_accuracy = 0.0
 
     print()
     print("=" * 60)
@@ -685,7 +646,7 @@ def main() -> None:
 
     print(
         f"Curriculum stage:      "
-        f"{env.curriculum_stage}"
+        f"{stage}"
     )
 
     print(
@@ -694,37 +655,25 @@ def main() -> None:
     )
 
     print()
-
     print(
-        f"Episodes:              "
-        f"{count}"
+        f"Episodes:              {count}"
     )
-
     print(
-        f"Wins:                  "
-        f"{wins}"
+        f"Wins:                  {wins}"
     )
-
     print(
-        f"Deaths:                "
-        f"{deaths}"
+        f"Deaths:                {deaths}"
     )
-
     print(
-        f"Timeouts:              "
-        f"{timeouts}"
+        f"Timeouts:              {timeouts}"
     )
-
     print(
-        f"Unknown:               "
-        f"{unknown}"
+        f"Unknown:               {unknown}"
     )
-
     print(
         f"Win rate:              "
         f"{win_rate:.1f}%"
     )
-
     print(
         f"Timeout rate:          "
         f"{timeout_rate:.1f}%"
@@ -732,11 +681,16 @@ def main() -> None:
 
     print()
 
-    if final_target_room_exits > 0:
+    print(
+        f"Mean encounter enemies:"
+        f" {mean(encounter_enemy_values):.2f}"
+    )
+
+    if target_room_exits > 0:
         print(
             f"Mean rooms exited:     "
             f"{mean(rooms_values):.2f}/"
-            f"{final_target_room_exits}"
+            f"{target_room_exits}"
         )
 
     print(
@@ -749,11 +703,10 @@ def main() -> None:
         f"{mean(lengths):.1f}"
     )
 
-    if winning_lengths:
-        print(
-            f"Mean winning length:   "
-            f"{mean(winning_lengths):.1f}"
-        )
+    print(
+        f"Mean target switches:  "
+        f"{mean(target_switch_values):.1f}"
+    )
 
     print()
 
@@ -766,8 +719,6 @@ def main() -> None:
         f"Mean remaining HP:     "
         f"{mean(remaining_hp_values):.2f}"
     )
-
-    print()
 
     print(
         f"No-hit episodes:       "
@@ -811,12 +762,7 @@ def main() -> None:
 
     print(
         f"Overall tear accuracy: "
-        f"{overall_tear_accuracy:.1f}%"
-    )
-
-    print(
-        f"Unresolved at end:     "
-        f"{total_unresolved_tears}"
+        f"{overall_accuracy:.1f}%"
     )
 
     print()
@@ -825,8 +771,7 @@ def main() -> None:
     print("-" * 60)
 
     print_distribution(
-        "",
-        combat_shoot_counts,
+        combat_shoot_counts
     )
 
     print()
@@ -835,8 +780,7 @@ def main() -> None:
     print("-" * 60)
 
     print_distribution(
-        "",
-        combat_move_counts,
+        combat_move_counts
     )
 
     print()
@@ -852,11 +796,6 @@ def main() -> None:
     print(
         f"Mean missing targets:  "
         f"{mean(nav_missing_values):.1f}"
-    )
-
-    print(
-        f"Mean zero-candidate:   "
-        f"{mean(zero_candidate_values):.1f}"
     )
 
     print(
